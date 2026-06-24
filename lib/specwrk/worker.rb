@@ -85,7 +85,7 @@ module Specwrk
     end
 
     def complete_examples
-      @next_examples = client.complete_and_fetch_examples executor.examples
+      @next_examples = client.complete_and_fetch_examples(executor.examples + executor.unexecuted_examples)
     rescue UnhandledResponseError => e
       # I do not think we should so lightly abandon the completion of executed examples
       # try to complete until successful or terminated

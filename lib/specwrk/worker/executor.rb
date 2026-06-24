@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require "tempfile"
+require "time"
 
 require "rspec/core"
 
@@ -22,10 +23,48 @@ module Specwrk
       def run(examples)
         reset!
 
+        @assigned_examples = examples
         example_ids = examples.map { |example| example[:id] }
 
         options = RSpec::Core::ConfigurationOptions.new ["--format", "Specwrk::Worker::NullFormatter"] + example_ids
         RSpec::Core::Runner.new(options).run($stderr, $stdout)
+      end
+
+      # Examples this worker was asked to run but which produced no result — e.g.
+      # the spec file raised while loading, so RSpec never executed them. We
+      # report them as failures so the server releases them from its processing
+      # queue; otherwise they sit there held by a worker that is still alive and
+      # heartbeating, so they never expire and the run hangs forever.
+      def unexecuted_examples
+        return [] if Specwrk.force_quit
+        return [] unless @assigned_examples
+
+        executed_ids = examples.map { |example| example[:id] }
+
+        @assigned_examples
+          .reject { |example| executed_ids.include?(example[:id]) }
+          .map { |example| unexecuted_failure(example) }
+      end
+
+      def unexecuted_failure(example)
+        now = Time.now.iso8601(6)
+
+        {
+          id: example[:id],
+          full_description: example[:full_description] || example[:id],
+          status: "failed",
+          file_path: example[:file_path],
+          line_number: example[:line_number],
+          started_at: now,
+          finished_at: now,
+          run_time: 0.0,
+          exception: {
+            class: "Specwrk::Worker::UnexecutedExample",
+            message: "Example was not executed by the worker — its spec file likely failed to load. " \
+              "Marked as failed by specwrk so the run can complete instead of stalling.",
+            backtrace: []
+          }
+        }
       end
 
       # https://github.com/skroutz/rspecq/blob/341383ce3ca25f42fad5483cbb6a00ba1c405570/lib/rspecq/worker.rb#L208-L224

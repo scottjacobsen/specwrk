@@ -12,7 +12,8 @@ RSpec.describe Specwrk::Worker do
   let(:executor) do
     instance_double Specwrk::Worker::Executor,
       final_output: tempfile,
-      examples: %w[a.rb:1 b.rb:2]
+      examples: %w[a.rb:1 b.rb:2],
+      unexecuted_examples: []
   end
 
   before do
@@ -249,6 +250,19 @@ RSpec.describe Specwrk::Worker do
     it "tries completing examples and fetching new ones" do
       expect(client).to receive(:complete_and_fetch_examples)
         .with(executor.examples)
+        .and_return("foobar")
+
+      instance.complete_examples
+
+      expect(instance.instance_variable_get(:@next_examples)).to eq("foobar")
+    end
+
+    it "also reports examples that were assigned but never executed" do
+      unexecuted = [{id: "c.rb:3", status: "failed"}]
+      allow(executor).to receive(:unexecuted_examples).and_return(unexecuted)
+
+      expect(client).to receive(:complete_and_fetch_examples)
+        .with(%w[a.rb:1 b.rb:2] + unexecuted)
         .and_return("foobar")
 
       instance.complete_examples

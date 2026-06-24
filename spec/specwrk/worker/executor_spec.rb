@@ -68,6 +68,53 @@ RSpec.describe Specwrk::Worker::Executor do
     end
   end
 
+  describe "#unexecuted_examples" do
+    let(:assigned) do
+      [
+        {id: "foo.rb[1:1]", file_path: "foo.rb", line_number: 1},
+        {id: "bar.rb[1:1]", file_path: "bar.rb", line_number: 1}
+      ]
+    end
+
+    before do
+      instance.instance_variable_set(:@assigned_examples, assigned)
+      allow(instance).to receive(:examples).and_return([{id: "foo.rb[1:1]", status: "passed"}])
+    end
+
+    it "returns a failure for each assigned example that produced no result" do
+      expect(instance.unexecuted_examples).to contain_exactly(
+        a_hash_including(
+          id: "bar.rb[1:1]",
+          status: "failed",
+          file_path: "bar.rb",
+          line_number: 1,
+          run_time: 0.0,
+          exception: a_hash_including(class: "Specwrk::Worker::UnexecutedExample")
+        )
+      )
+    end
+
+    it "returns nothing when every assigned example was executed" do
+      allow(instance).to receive(:examples)
+        .and_return([{id: "foo.rb[1:1]", status: "passed"}, {id: "bar.rb[1:1]", status: "failed"}])
+
+      expect(instance.unexecuted_examples).to eq([])
+    end
+
+    it "returns nothing when force quitting (let the server expire them instead)" do
+      previous_force_quit = Specwrk.force_quit
+      Specwrk.force_quit = true
+      expect(instance.unexecuted_examples).to eq([])
+    ensure
+      Specwrk.force_quit = previous_force_quit
+    end
+
+    it "returns nothing before any examples have been assigned" do
+      instance.instance_variable_set(:@assigned_examples, nil)
+      expect(instance.unexecuted_examples).to eq([])
+    end
+  end
+
   describe "#reset!" do
     around do |ex|
       previous_force_quit = Specwrk.force_quit

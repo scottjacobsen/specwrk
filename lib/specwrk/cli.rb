@@ -217,7 +217,9 @@ module Specwrk
       end
 
       def status
-        @exited_pids.value?(1) ? 1 : 0
+        # Workers exit with their failure count, so any non-zero status (not
+        # just 1) means examples failed or a worker died.
+        @exited_pids.values.any?(&:nonzero?) ? 1 : 0
       end
     end
 
