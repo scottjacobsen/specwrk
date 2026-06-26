@@ -39,6 +39,21 @@ module Specwrk
       exited_pids
     end
 
+    # The spec file an example belongs to, derived from its rerun id
+    # ("./spec/a_spec.rb[1:2]" or "spec/a_spec.rb:12" -> "./spec/a_spec.rb").
+    # RSpec's metadata file_path points at the file where the example is
+    # DEFINED — for a shared example that's the shared-examples file, shared by
+    # every spec built from it — so file_path must never be used to group
+    # examples into file buckets: it lumps all of them into one giant
+    # unsplittable pseudo-file. Falls back to file_path when there's no id.
+    def example_file_key(example)
+      file = example[:id].to_s[/\A[^\[]+/]&.sub(/(:\d+)+\z/, "")
+
+      return example[:file_path] if file.nil? || file.empty?
+
+      file
+    end
+
     def human_readable_duration(total_seconds, precision: 2)
       secs = total_seconds.to_f
       hours = (secs / 3600).to_i

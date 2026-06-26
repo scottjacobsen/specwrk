@@ -49,6 +49,31 @@ RSpec.describe Specwrk::Web::Endpoints::Seed do
     end
   end
 
+  context "shared-example specs seeded under one shared file_path" do
+    let(:body) do
+      JSON.generate(examples: [
+        {id: "a_spec.rb:1", file_path: "shared_examples.rb"},
+        {id: "b_spec.rb:1", file_path: "shared_examples.rb"},
+        {id: "a_spec.rb:2", file_path: "shared_examples.rb"}
+      ])
+    end
+
+    # RSpec reports a shared example's file_path as the file where it is
+    # DEFINED, so specs from different files share one file_path. Sorting and
+    # grouping by it lumps them all into a single giant pseudo-file bucket;
+    # the example id's file component is the real spec file.
+    it "creates buckets by the examples' real spec files" do
+      subject
+
+      first_bucket_id = pending.shift_bucket
+      second_bucket_id = pending.shift_bucket
+
+      expect(Specwrk::BucketStore.new(datastore_uri, File.join("pending", "buckets", first_bucket_id)).examples.map { |ex| ex[:id] }).to eq(%w[a_spec.rb:1 a_spec.rb:2])
+      expect(Specwrk::BucketStore.new(datastore_uri, File.join("pending", "buckets", second_bucket_id)).examples.map { |ex| ex[:id] }).to eq(%w[b_spec.rb:1])
+      expect(pending.shift_bucket).to be_nil
+    end
+  end
+
   context "merged with run_time_bucket_maximum sorted by timings" do
     let(:existing_run_times_data) do
       {

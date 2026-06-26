@@ -5,6 +5,22 @@ RSpec.describe Specwrk do
     expect(Specwrk::VERSION).not_to be nil
   end
 
+  describe ".example_file_key" do
+    it "extracts the spec file from a bracketed rerun id" do
+      example = {id: "./spec/a_spec.rb[1:2:1]", file_path: "./spec/support/shared_examples.rb"}
+
+      expect(described_class.example_file_key(example)).to eq("./spec/a_spec.rb")
+    end
+
+    it "extracts the spec file from a file:line style id" do
+      expect(described_class.example_file_key({id: "a_spec.rb:12", file_path: "a_spec.rb"})).to eq("a_spec.rb")
+    end
+
+    it "falls back to file_path when there is no id" do
+      expect(described_class.example_file_key({file_path: "a_spec.rb"})).to eq("a_spec.rb")
+    end
+  end
+
   describe ".wait_for_pids_exit" do
     subject { described_class.wait_for_pids_exit(pids) }
 

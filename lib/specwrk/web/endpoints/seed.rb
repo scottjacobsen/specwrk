@@ -43,8 +43,11 @@ module Specwrk
                 -(entry.last[:expected_run_time] || Float::INFINITY)
               end
             else
+              # Sort by the real spec file (from the example id) so a file's
+              # examples are adjacent for file grouping — file_path is the
+              # DEFINITION file, shared by every spec built from a shared example.
               unsorted_examples_with_run_times.sort_by do |entry|
-                entry.last[:file_path]
+                Specwrk.example_file_key(entry.last)
               end
             end
 
