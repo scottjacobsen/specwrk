@@ -19,6 +19,57 @@ module Specwrk
     attr_accessor :force_quit, :net_http
     attr_reader :starting_pid
 
+    # Run in the parent once the app is preloaded, before any per-bucket fork, so
+    # children inherit no live database connections and no locked connection-pool
+    # mutexes. clear_all_connections! is graceful (safe here — no fork has
+    # happened yet) and leaves the pools reusable, so each child lazily opens its
+    # own fresh connections on first query.
+    def prepare_for_fork!
+      return unless defined?(::ActiveRecord::Base)
+
+      ::ActiveRecord::Base.connection_handler.clear_all_connections!
+    rescue => e
+      warn "specwrk: clearing ActiveRecord connections before fork failed: #{e.class}: #{e.message}"
+    end
+
+    # Callbacks run inside each per-bucket child immediately after fork, before
+    # the bucket's examples run. ActiveRecord reconnects lazily from the cleared
+    # pools; register here to reset anything else that doesn't survive a fork
+    # (ClickHouse, Kafka, Redis, ...).
+    def after_fork(&block)
+      after_fork_hooks << block
+    end
+
+    def after_fork!
+      after_fork_hooks.each(&:call)
+    end
+
+    def after_fork_hooks
+      @after_fork_hooks ||= []
+    end
+
+    # Callbacks run inside each per-bucket child right before it hard-exits.
+    # Process.exit! deliberately skips at_exit hooks (a booted app's at_exit
+    # can hang the shutdown), so anything that normally flushes state at exit
+    # — e.g. SimpleCov writing its coverage resultset — must be flushed here.
+    # Hooks run after the bucket's results are written; a hook failure is
+    # warned and swallowed so it can never fail the bucket.
+    def before_fork_exit(&block)
+      before_fork_exit_hooks << block
+    end
+
+    def before_fork_exit!
+      before_fork_exit_hooks.each do |hook|
+        hook.call
+      rescue => e
+        warn "specwrk: before_fork_exit hook failed: #{e.class}: #{e.message}"
+      end
+    end
+
+    def before_fork_exit_hooks
+      @before_fork_exit_hooks ||= []
+    end
+
     def wait_for_pids_exit(pids)
       exited_pids = {}
 

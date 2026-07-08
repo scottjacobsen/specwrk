@@ -126,11 +126,6 @@ RSpec.describe Specwrk::Worker do
           count >= 5
         end
 
-        expect($stdout).to receive(:write)
-          .with("foo")
-        expect($stdout).to receive(:write)
-          .with("bar")
-
         expect(subject).to eq(1)
       end
     end
@@ -151,10 +146,19 @@ RSpec.describe Specwrk::Worker do
           count += 1
         end
 
-        expect($stdout).to receive(:write)
-          .with("foo")
-        expect($stdout).to receive(:write)
-          .with("bar")
+        expect(subject).to eq(0)
+      end
+
+      # The parent's state matters too: forked children get ZEROED Coverage
+      # counters (MRI resets them on fork), so anything executed only in the
+      # parent — e.g. a Rails eager load during preload — is visible solely in
+      # the parent's own coverage. The parent must flush exit-time state like
+      # its children do, before the init script hard-exits the process.
+      it "runs before_fork_exit hooks in the parent after the run completes" do
+        expect(client).to receive(:worker_status).and_return(0)
+        expect(instance).to receive(:execute).and_raise(Specwrk::CompletedAllExamplesError)
+
+        expect(Specwrk).to receive(:before_fork_exit!)
 
         expect(subject).to eq(0)
       end
@@ -211,11 +215,6 @@ RSpec.describe Specwrk::Worker do
           end
         end
 
-        expect($stdout).to receive(:write)
-          .with("foo")
-        expect($stdout).to receive(:write)
-          .with("bar")
-
         expect(subject).to eq(0)
         expect(completed).to eq(true) # ensures the loop was broken in the way we expected
       end
@@ -223,20 +222,24 @@ RSpec.describe Specwrk::Worker do
   end
 
   describe "#execute" do
-    it "tries fetching examples, executing them, and completing them" do
-      expect(executor).to receive(:run)
-        .with(client.fetch_examples)
+    it "fetches a bucket, runs it in a fork, and completes it with the results" do
+      results = [{id: "a.rb:1", status: "passed"}]
+
+      expect(instance).to receive(:run_in_fork)
+        .with(%w[a.rb:1 b.rb:2])
+        .and_return(results)
 
       expect(instance).to receive(:complete_examples)
+        .with(results)
 
-      expect { instance.execute }.to change { instance.next_examples.object_id }
+      instance.execute
     end
 
-    it "warns when an unhandled error is raised" do
+    it "warns when an unhandled error is raised fetching examples" do
       expect(client).to receive(:fetch_examples)
         .and_raise(Specwrk::UnhandledResponseError, "oops")
 
-      expect(executor).not_to receive(:run)
+      expect(instance).not_to receive(:run_in_fork)
       expect(instance).not_to receive(:complete_examples)
 
       expect(instance).to receive(:warn)
@@ -247,35 +250,24 @@ RSpec.describe Specwrk::Worker do
   end
 
   describe "#complete_examples" do
-    it "tries completing examples and fetching new ones" do
+    let(:results) { [{id: "a.rb:1", status: "passed"}] }
+
+    it "completes the given results and fetches the next bucket" do
       expect(client).to receive(:complete_and_fetch_examples)
-        .with(executor.examples)
+        .with(results)
         .and_return("foobar")
 
-      instance.complete_examples
-
-      expect(instance.instance_variable_get(:@next_examples)).to eq("foobar")
-    end
-
-    it "also reports examples that were assigned but never executed" do
-      unexecuted = [{id: "c.rb:3", status: "failed"}]
-      allow(executor).to receive(:unexecuted_examples).and_return(unexecuted)
-
-      expect(client).to receive(:complete_and_fetch_examples)
-        .with(%w[a.rb:1 b.rb:2] + unexecuted)
-        .and_return("foobar")
-
-      instance.complete_examples
+      instance.complete_examples(results)
 
       expect(instance.instance_variable_get(:@next_examples)).to eq("foobar")
     end
 
     it "tries completing examples again when an unhandled error is raised" do
-      expect(client).to receive(:complete_and_fetch_examples).with(executor.examples)
+      expect(client).to receive(:complete_and_fetch_examples).with(results)
         .and_raise(Specwrk::UnhandledResponseError, "oops")
         .ordered
 
-      expect(client).to receive(:complete_and_fetch_examples).with(executor.examples)
+      expect(client).to receive(:complete_and_fetch_examples).with(results)
         .ordered
 
       expect(instance).to receive(:warn)
@@ -283,7 +275,85 @@ RSpec.describe Specwrk::Worker do
       expect(instance).to receive(:sleep)
         .with(1)
 
-      instance.complete_examples
+      instance.complete_examples(results)
+    end
+  end
+
+  describe "#run_in_fork" do
+    after { Specwrk.before_fork_exit_hooks.clear }
+
+    # The child hard-exits (Process.exit! skips at_exit hooks), so state that
+    # is normally flushed at exit — e.g. SimpleCov's resultset — must go
+    # through before_fork_exit hooks. Real fork: the child inherits this
+    # spec's stubs and the hook writes through to a file the parent can read.
+    it "runs before_fork_exit hooks in the child before it exits" do
+      flag = Tempfile.new("specwrk-hook-flag")
+      flag.close
+      Specwrk.before_fork_exit { File.write(flag.path, "ran in #{Process.pid}") }
+
+      allow(executor).to receive(:run)
+      results = instance.run_in_fork([{id: "a.rb:1", file_path: "a.rb"}])
+
+      expect(File.read(flag.path)).to start_with("ran in ")
+      expect(File.read(flag.path)).not_to eq("ran in #{Process.pid}") # ran in the child, not here
+      expect(results).to eq(%w[a.rb:1 b.rb:2]) # executor double's examples, via the results file
+    ensure
+      flag&.unlink
+    end
+  end
+
+  describe "#decode_bucket_results" do
+    let(:examples) { [{id: "a.rb:1", file_path: "a.rb", line_number: 1}] }
+
+    it "parses the child's JSON payload on success" do
+      data = JSON.generate([{id: "a.rb:1", status: "passed"}])
+
+      expect(instance.decode_bucket_results(examples, true, data))
+        .to eq([{id: "a.rb:1", status: "passed"}])
+    end
+
+    it "reports the bucket's examples as failures when the child failed" do
+      allow(executor).to receive(:unexecuted_failure)
+        .with(examples.first)
+        .and_return({id: "a.rb:1", status: "failed"})
+      allow(instance).to receive(:warn)
+
+      expect(instance.decode_bucket_results(examples, false, ""))
+        .to eq([{id: "a.rb:1", status: "failed"}])
+    end
+
+    it "reports failures when the child exited cleanly but wrote nothing" do
+      allow(executor).to receive(:unexecuted_failure)
+        .with(examples.first)
+        .and_return({id: "a.rb:1", status: "failed"})
+      allow(instance).to receive(:warn)
+
+      expect(instance.decode_bucket_results(examples, true, ""))
+        .to eq([{id: "a.rb:1", status: "failed"}])
+    end
+  end
+
+  describe "#preload!" do
+    around do |ex|
+      original = ENV["SPECWRK_PRELOAD"]
+      ex.run
+      ENV["SPECWRK_PRELOAD"] = original
+    end
+
+    it "requires the SPECWRK_PRELOAD file when set" do
+      ENV["SPECWRK_PRELOAD"] = "tempfile"
+
+      expect(instance).to receive(:require).with("tempfile")
+
+      instance.preload!
+    end
+
+    it "does nothing when SPECWRK_PRELOAD is unset" do
+      ENV.delete("SPECWRK_PRELOAD")
+
+      expect(instance).not_to receive(:require)
+
+      instance.preload!
     end
   end
 

@@ -19,6 +19,11 @@ module Specwrk
         writer = IO.for_fd(Integer(ENV.fetch("SPECWRK_FINAL_FD")))
         $final_output = writer # standard:disable Style/GlobalVars
         $final_output.sync = true # standard:disable Style/GlobalVars
+        # Don't leak this pipe into processes the per-bucket child execs (e.g. the
+        # browser a system spec launches). If an orphaned browser keeps the write
+        # end open, the parent's drain_outputs blocks on EOF forever and the node
+        # is killed on CI's no-output timeout long after the tests finished.
+        $final_output.close_on_exec = true # standard:disable Style/GlobalVars
         $stdout.sync = true
         $stderr.sync = true
 
@@ -31,8 +36,15 @@ module Specwrk
         end
 
         status = Specwrk::Worker.run!
+        $stdout.flush
         $final_output.close # standard:disable Style/GlobalVars
-        exit(status)
+        # Hard-exit (skip at_exit) once the run is reported. A booted app can
+        # register at_exit hooks that block on shutdown (e.g. Datadog flushing
+        # traces to an absent agent); with output already flushed those hooks add
+        # nothing, and letting them run left the worker silent until CI killed it
+        # at the 10-minute no-output timeout. The per-bucket children already
+        # exit! for the same reason.
+        exit!(status)
       RUBY
 
       def start_workers

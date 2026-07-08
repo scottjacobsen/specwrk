@@ -21,6 +21,34 @@ RSpec.describe Specwrk do
     end
   end
 
+  describe ".before_fork_exit!" do
+    after { described_class.before_fork_exit_hooks.clear }
+
+    it "runs registered hooks in order" do
+      calls = []
+      described_class.before_fork_exit { calls << :first }
+      described_class.before_fork_exit { calls << :second }
+
+      described_class.before_fork_exit!
+
+      expect(calls).to eq(%i[first second])
+    end
+
+    # A hook failure (e.g. a coverage flush blowing up) must never fail the
+    # bucket — its results are already written; warn and keep going.
+    it "warns and continues when a hook raises" do
+      calls = []
+      described_class.before_fork_exit { raise "boom" }
+      described_class.before_fork_exit { calls << :second }
+
+      expect(described_class).to receive(:warn).with(a_string_including("boom"))
+
+      described_class.before_fork_exit!
+
+      expect(calls).to eq([:second])
+    end
+  end
+
   describe ".wait_for_pids_exit" do
     subject { described_class.wait_for_pids_exit(pids) }
 
