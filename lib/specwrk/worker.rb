@@ -4,6 +4,7 @@ require "stringio"
 require "fileutils"
 require "json"
 require "tempfile"
+require "time"
 
 require "specwrk/client"
 require "specwrk/worker/executor"
@@ -40,9 +41,20 @@ module Specwrk
         @all_examples_completed = true
         break
       rescue NoMoreExamplesError
-        # Wait for the other processes (workers) on the same host to finish
-        # This will cause workers to 'hang' until all work has been completed
-        # TODO: break here if all the other worker processes on this host are done executing examples
+        # The queue is drained for now. Wait briefly so a straggler's expired and
+        # requeued bucket can still be stolen — but NEVER wait forever. An
+        # orphaned/stuck bucket can mean the server never signals "all complete"
+        # (410), and a silent infinite wait here gets the CI job killed by a
+        # no-output timeout (~10m) long after the tests actually finished. Emit a
+        # timestamped line each cycle so the test→idle boundary is visible and
+        # output keeps flowing, then exit once the wait is exhausted.
+        @no_work_waits = (@no_work_waits || 0) + 1
+        if @no_work_waits > no_work_max
+          log_ts "queue drained (no work after #{@no_work_waits} checks) — exiting"
+          @all_examples_completed = true
+          break
+        end
+        log_ts "no work yet, waiting for stragglers (#{@no_work_waits}/#{no_work_max})" if (@no_work_waits % 10) == 1
         sleep 0.5
       rescue WaitingForSeedError
         @seed_wait_count ||= 0
@@ -109,9 +121,12 @@ module Specwrk
     # an audit event firing N times instead of once on the Nth bucket).
     def execute
       examples = next_examples
+      @no_work_waits = 0 # got work — reset the idle-exit counter
       @next_examples = nil
 
-      complete_examples run_in_fork(examples)
+      results = run_in_fork(examples)
+      log_ts "ran #{results.length} examples"
+      complete_examples results
     rescue UnhandledResponseError => e
       # If fetching examples via next_examples fails we can just try again so warn and return
       # Expects complete_examples to rescue this error if raised in that method
@@ -156,13 +171,36 @@ module Specwrk
         Process.exit!(0)
       end
 
-      _, wait_status = Process.wait2(pid)
+      wait_status = wait_for_child(pid)
+      if wait_status.nil?
+        # The child blew past the bucket timeout — almost certainly a hung example
+        # (e.g. a wedged browser in a system spec). Kill it and report the bucket
+        # as failures rather than letting one hung test stall the whole node in an
+        # unbounded Process.wait2 until CI's no-output timeout kills the container.
+        Process.kill("KILL", pid)
+        Process.wait(pid)
+        log_ts "bucket exceeded #{bucket_timeout}s — killed child #{pid}, reporting its examples as failures"
+        return examples.map { |example| executor.unexecuted_failure(example) }
+      end
+
       decode_bucket_results(examples, wait_status.success?, File.read(results_file.path))
     rescue => e
       warn "bucket execution failed: #{e.class}: #{e.message}; reporting its examples as failures"
       examples.map { |example| executor.unexecuted_failure(example) }
     ensure
       results_file&.unlink
+    end
+
+    # Reap the child, but give up after bucket_timeout so a hung example can't
+    # stall the node. Returns the Process::Status on exit, or nil on timeout.
+    def wait_for_child(pid)
+      deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + bucket_timeout
+      loop do
+        _, status = Process.wait2(pid, Process::WNOHANG)
+        return status if status
+        return nil if Process.clock_gettime(Process::CLOCK_MONOTONIC) > deadline
+        sleep 0.5
+      end
     end
 
     def decode_bucket_results(examples, success, data)
@@ -199,6 +237,29 @@ module Specwrk
 
     def final_output
       $final_output || $stdout # standard:disable Style/GlobalVars
+    end
+
+    # How many empty /pop checks (0.5s apart) to tolerate before a worker gives up
+    # waiting for stragglers and exits. Default ~60s — long enough to steal an
+    # expired/requeued bucket (heartbeat expiry is ~20s), short enough to never
+    # trip CI's no-output timeout. Override with SPECWRK_NO_WORK_WAITS.
+    def no_work_max
+      @no_work_max ||= ENV.fetch("SPECWRK_NO_WORK_WAITS", "120").to_i
+    end
+
+    # Max seconds to wait for a single bucket's child before killing it as hung.
+    # Well above any legit bucket (buckets target ~10s of run time) and below CI's
+    # ~10m no-output timeout, so a wedged example fails its bucket instead of
+    # stalling the whole node. Override with SPECWRK_BUCKET_TIMEOUT.
+    def bucket_timeout
+      @bucket_timeout ||= ENV.fetch("SPECWRK_BUCKET_TIMEOUT", "300").to_i
+    end
+
+    # Timestamped line to stdout so the CI log shows when each bucket finished and
+    # where the test→idle boundary is (specwrk's own output is otherwise untimed).
+    def log_ts(msg)
+      $stdout.puts "[#{Time.now.utc.iso8601}] #{ENV.fetch("SPECWRK_ID", "specwrk-worker")}: #{msg}"
+      $stdout.flush
     end
 
     def status

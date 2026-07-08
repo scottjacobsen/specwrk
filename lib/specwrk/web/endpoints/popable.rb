@@ -13,9 +13,10 @@ module Specwrk
             [200, {"content-type" => "application/json"}, [JSON.generate(examples)]]
           elsif pending.empty? && processing.empty? && completed.empty?
             [204, {"content-type" => "text/plain"}, ["Waiting for sample to be seeded."]]
-          elsif completed.any? && processing.empty?
-            [410, {"content-type" => "text/plain"}, ["That's a good lad. Run along now and go home."]]
           elsif expired_examples.length.positive?
+            # A worker missed its heartbeats; reclaim its in-flight examples back
+            # onto the queue so a live worker can run them. Checked BEFORE the
+            # all-done response so dead-worker work is recovered, not abandoned.
             expired_examples.each { |_id, example| example[:worker_id] = worker_id }
 
             with_lock do
@@ -26,6 +27,17 @@ module Specwrk
             @examples = nil
 
             [200, {"content-type" => "application/json"}, [JSON.generate(examples)]]
+          elsif completed.any? && pending.length.zero?
+            # The bucket queue is drained and there's nothing to reclaim, so there
+            # is no more work to hand out: tell the worker to go home. This used to
+            # require processing.empty?, but a straggler left in processing (whose
+            # owning worker is alive but idle) would then NEVER clear, so this 410
+            # never fired and workers spin-polled /pop forever — starving the
+            # single-process server until CI killed everyone on the no-output
+            # timeout. Keying off the drained queue instead terminates cleanly;
+            # any worker still running a bucket finishes and gets this on its next
+            # request (its results are recorded before this response).
+            [410, {"content-type" => "text/plain"}, ["That's a good lad. Run along now and go home."]]
           else
             not_found
           end
@@ -33,7 +45,7 @@ module Specwrk
 
         def examples
           @examples ||= begin
-            return [] if pending.empty?
+            return [] if pending.length.zero?
             bucket_id = with_lock { pending.shift_bucket }
             return [] if bucket_id.nil?
 

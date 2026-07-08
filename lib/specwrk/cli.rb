@@ -219,7 +219,20 @@ module Specwrk
         drain_outputs
 
         require "specwrk/cli_reporter"
-        Specwrk::CLIReporter.new.report
+        # Best-effort run summary. /report dumps every completed example, so in a
+        # large multi-node run all nodes hitting it at once (right after their
+        # workers exit) wedge the single-process server and the fetch hangs until
+        # CI's no-output timeout kills the job. The pass/fail exit status comes
+        # from the workers (#status), not this summary, so bound it hard and never
+        # let it block the job. Override the cap with SPECWRK_REPORT_TIMEOUT.
+        begin
+          require "timeout"
+          Timeout.timeout(ENV.fetch("SPECWRK_REPORT_TIMEOUT", "30").to_i) do
+            Specwrk::CLIReporter.new.report
+          end
+        rescue => e
+          warn "Skipping run summary report: #{e.class}: #{e.message}"
+        end
 
         exit(status)
       end

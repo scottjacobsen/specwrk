@@ -27,7 +27,7 @@ RSpec.describe Specwrk::Web::Endpoints::CompleteAndPop do
       }
     end
 
-    it { is_expected.to eq([404, {"content-type" => "text/plain", "x-specwrk-status" => "1"}, ["This is not the path you're looking for, 'ol chap..."]]) } # 404 since there are no more items in the pending queue
+    it { is_expected.to eq([410, {"content-type" => "text/plain", "x-specwrk-status" => "1"}, ["That's a good lad. Run along now and go home."]]) } # 410: the pending queue is drained, so there's no more work to hand out — go home even though an orphaned straggler (a.rb:2, no live worker) remains in processing. Previously this returned 404 and the worker spin-polled forever, starving the server.
     it { expect { subject }.to change { run_times.reload.length }.from(0).to(4) }
     it { expect { subject }.to change { processing.reload.length }.from(4).to(1) }
     it { expect { subject }.to change { completed.reload.length }.from(0).to(3) }

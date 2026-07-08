@@ -38,6 +38,8 @@ RSpec.describe Specwrk::Worker do
       .with("foo")
     allow($stdout).to receive(:write)
       .with("bar")
+
+    allow_any_instance_of(described_class).to receive(:log_ts)
   end
 
   around do |ex|
@@ -217,6 +219,25 @@ RSpec.describe Specwrk::Worker do
 
         expect(subject).to eq(0)
         expect(completed).to eq(true) # ensures the loop was broken in the way we expected
+      end
+    end
+
+    context "queue stays drained past the no-work limit" do
+      before { allow(Specwrk::Client).to receive(:wait_for_server!) }
+
+      it "exits cleanly instead of waiting forever (the CI no-output hang fix)" do
+        allow(instance).to receive(:no_work_max).and_return(3)
+        allow(client).to receive(:worker_status).and_return(0)
+
+        expect(instance).to receive(:sleep)
+          .with(0.5)
+          .exactly(3).times
+
+        expect(instance).to receive(:execute)
+          .and_raise(Specwrk::NoMoreExamplesError)
+          .exactly(4).times
+
+        expect(subject).to eq(0)
       end
     end
   end
