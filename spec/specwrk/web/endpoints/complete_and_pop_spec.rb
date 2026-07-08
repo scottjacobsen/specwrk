@@ -28,12 +28,56 @@ RSpec.describe Specwrk::Web::Endpoints::CompleteAndPop do
     end
 
     it { is_expected.to eq([410, {"content-type" => "text/plain", "x-specwrk-status" => "1"}, ["That's a good lad. Run along now and go home."]]) } # 410: the pending queue is drained, so there's no more work to hand out — go home even though an orphaned straggler (a.rb:2, no live worker) remains in processing. Previously this returned 404 and the worker spin-polled forever, starving the server.
-    it { expect { subject }.to change { run_times.reload.length }.from(0).to(4) }
+    # Only the PASSED examples' run times are recorded (a.rb:1 and a.rb:3):
+    # failures and pendings are not scheduling signal — a cascade of
+    # fast-failing examples (e.g. a poisoned worker where everything dies in
+    # microseconds) would otherwise write absurdly tiny "measured" times that
+    # the batched grouping then packs into unfinishable mega-buckets.
+    it { expect { subject }.to change { run_times.reload.length }.from(0).to(2) }
+    it "does not record run times for failed or pending examples" do
+      subject
+
+      expect(run_times.reload["a.rb:1"]).to eq(0.1)
+      expect(run_times["a.rb:4"]).to be_nil # pending
+      expect(run_times["a.rb:5"]).to be_nil # failed
+    end
     it { expect { subject }.to change { processing.reload.length }.from(4).to(1) }
     it { expect { subject }.to change { completed.reload.length }.from(0).to(3) }
     it { expect { subject }.to change { worker["passed"] }.from(nil).to(1) }
     it { expect { subject }.to change { worker["failed"] }.from(nil).to(1) }
     it { expect { subject }.to change { worker["pending"] }.from(nil).to(1) }
+  end
+
+  context "completes examples that never actually ran" do
+    let(:body) {
+      JSON.generate([
+        {id: "a.rb:1", file_path: "a.rb", run_time: 0.1, started_at: Time.now.iso8601, finished_at: Time.now.iso8601, status: "passed"},
+        {id: "a.rb:4", file_path: "a.rb", run_time: 0.0, started_at: Time.now.iso8601, finished_at: Time.now.iso8601, status: "failed"},
+        {id: "a.rb:5", file_path: "a.rb", status: "failed"}
+      ])
+    }
+
+    let(:existing_processing_data) do
+      {
+        "a.rb:1": {id: "a.rb:1", file_path: "a.rb", expected_run_time: 0.1},
+        "a.rb:4": {id: "a.rb:4", file_path: "a.rb", expected_run_time: 0.1},
+        "a.rb:5": {id: "a.rb:5", file_path: "a.rb", expected_run_time: 0.1}
+      }
+    end
+
+    # A result with no positive run_time is synthesized (e.g. an unexecuted
+    # example reported as failed after a child died), not measured. Recording
+    # its 0.0 would poison the run_times store: on the next run every poisoned
+    # file sorts as instantaneous and the batched grouping packs them all into
+    # one giant bucket.
+    it "records run times only for examples that actually ran" do
+      subject
+
+      expect(run_times.reload.length).to eq(1)
+      expect(run_times["a.rb:1"]).to eq(0.1)
+      expect(run_times["a.rb:4"]).to be_nil
+      expect(run_times["a.rb:5"]).to be_nil
+    end
   end
 
   context "successfully pops an item off the queue" do

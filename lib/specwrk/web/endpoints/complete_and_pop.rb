@@ -87,7 +87,19 @@ module Specwrk
         end
 
         def run_time_data
-          @run_time_data ||= payload.map { |example| [example[:id], example[:run_time]] }.to_h
+          # Record run times ONLY for passed examples. Synthesized results
+          # (unexecuted examples reported as failed after a child died) carry
+          # run_time 0.0, but real failures and skips also poison the store:
+          # a cascade that fails everything instantly (e.g. one bad connection
+          # state) records microsecond "measured" times for hundreds of
+          # browser specs, and the next run's batched grouping packs them all
+          # into one unfinishable mega-bucket. Passed times are the only
+          # trustworthy scheduling signal.
+          @run_time_data ||= payload.filter_map { |example|
+            next unless example[:status] == "passed"
+
+            [example[:id], example[:run_time]] if example[:run_time]&.positive?
+          }.to_h
         end
       end
     end
