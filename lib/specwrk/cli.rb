@@ -192,6 +192,16 @@ module Specwrk
         ENV["SPECWRK_SEED"] = "1"
         examples = ListExamples.new(dir).examples
 
+        # An empty enumeration almost always means the spec files failed to
+        # LOAD during discovery (e.g. the app's spec helper needed a database
+        # that isn't available here) — every worker would then find an empty
+        # queue and the run would silently test nothing. Fail loudly instead.
+        if examples.empty?
+          warn "specwrk seed: no examples enumerated from #{dir.join(", ")} — refusing to seed an empty run. " \
+            "Spec files likely failed to load during discovery; check the errors above."
+          exit 1
+        end
+
         Client.wait_for_server!
         Client.new.seed(examples, max_retries)
         file_count = examples.group_by { |e| e[:file_path] }.keys.size
@@ -218,27 +228,33 @@ module Specwrk
         wait_for_workers_exit
         drain_outputs
 
-        require "specwrk/cli_reporter"
-        # Best-effort run summary. /report dumps every completed example, so in a
-        # large multi-node run all nodes hitting it at once (right after their
-        # workers exit) wedge the single-process server and the fetch hangs until
-        # CI's no-output timeout kills the job. The pass/fail exit status comes
-        # from the workers (#status), not this summary, so bound it hard and never
-        # let it block the job. Override the cap with SPECWRK_REPORT_TIMEOUT.
-        begin
-          require "timeout"
-          Timeout.timeout(ENV.fetch("SPECWRK_REPORT_TIMEOUT", "30").to_i) do
-            Specwrk::CLIReporter.new.report
-          end
-        rescue => e
-          warn "Skipping run summary report: #{e.class}: #{e.message}"
-        end
+        print_run_summary if ENV["SPECWRK_RUN_SUMMARY"]
 
         exit(status)
       end
 
       def wait_for_workers_exit
         @exited_pids = Specwrk.wait_for_pids_exit(@worker_pids)
+      end
+
+      # Off by default: /report dumps every completed example, so in a large
+      # multi-node run all nodes hitting it at once (right after their workers
+      # exit) wedge the single-process server — measured at a median 13s / max
+      # 27s fetch per node at 80 workers, the dominant part of the post-drain
+      # exit tail. It's purely informational (the pass/fail exit status comes
+      # from the workers' own #status, not this summary), so a CI node skips it
+      # entirely unless SPECWRK_RUN_SUMMARY is set. When it does run, it stays
+      # bounded and best-effort — never let it block the job. Override the cap
+      # with SPECWRK_REPORT_TIMEOUT.
+      def print_run_summary
+        require "specwrk/cli_reporter"
+        require "timeout"
+
+        Timeout.timeout(ENV.fetch("SPECWRK_REPORT_TIMEOUT", "30").to_i) do
+          Specwrk::CLIReporter.new.report
+        end
+      rescue => e
+        warn "Skipping run summary report: #{e.class}: #{e.message}"
       end
 
       def status

@@ -5,7 +5,7 @@ require "specwrk/worker/progress_formatter"
 RSpec.describe Specwrk::Worker::ProgressFormatter do
   before do
     allow(RSpec::Core::Formatters).to receive(:register)
-      .with(described_class, :example_passed, :example_pending, :example_failed, :dump_failures, :dump_pending)
+      .with(described_class, :example_started, :example_passed, :example_pending, :example_failed, :dump_failures, :dump_pending)
   end
 
   let(:instance) { described_class.new(output) }
@@ -18,6 +18,23 @@ RSpec.describe Specwrk::Worker::ProgressFormatter do
       fully_formatted_failed_examples: "big fail",
       pending_examples: [1],
       fully_formatted_pending_examples: "a pending"
+  end
+
+  describe "#example_started" do
+    def notification_for(file)
+      instance_double(
+        RSpec::Core::Notifications::ExampleNotification,
+        example: instance_double(RSpec::Core::Example, metadata: {file_path: file})
+      )
+    end
+
+    it "prints each spec file once, when the running file changes" do
+      instance.example_started(notification_for("./spec/a_spec.rb"))
+      instance.example_started(notification_for("./spec/a_spec.rb"))
+      instance.example_started(notification_for("./spec/b_spec.rb"))
+
+      expect(output.string).to eq("\n./spec/a_spec.rb\n\n./spec/b_spec.rb\n")
+    end
   end
 
   describe "#example_passed" do

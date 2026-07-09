@@ -8,15 +8,26 @@ RSpec::Support.require_rspec_core "formatters/console_codes"
 module Specwrk
   class Worker
     class ProgressFormatter
-      RSpec::Core::Formatters.register self, :example_passed, :example_pending, :example_failed, :dump_failures, :dump_pending
+      RSpec::Core::Formatters.register self, :example_started, :example_passed, :example_pending, :example_failed, :dump_failures, :dump_pending
       attr_reader :output, :final_output
 
       def initialize(output)
         @output = output
+        @current_file = nil
 
         @final_output = Tempfile.new
         @final_output.define_singleton_method(:tty?) { true }
         @final_output.sync = true
+      end
+
+      # Print the spec file as the worker reaches it, so the progress output shows
+      # which files are running rather than an opaque wall of dots.
+      def example_started(notification)
+        file = notification.example.metadata[:file_path]
+        return if file == @current_file
+
+        @current_file = file
+        output.print "\n#{file}\n"
       end
 
       def example_passed(_notification)

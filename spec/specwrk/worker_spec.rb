@@ -3,8 +3,8 @@
 require "specwrk/worker"
 
 RSpec.describe Specwrk::Worker do
-  let(:client) { instance_double(Specwrk::Client, close: true) }
-  let(:heartbeat_client) { instance_double(Specwrk::Client, close: true) }
+  let(:client) { instance_double(Specwrk::Client, close: true, stats: {}) }
+  let(:heartbeat_client) { instance_double(Specwrk::Client, close: true, stats: {}) }
   let(:tempfile) { instance_double(Tempfile, rewind: true) }
   let(:thread) { instance_double(Thread, kill: true) }
 
@@ -21,7 +21,7 @@ RSpec.describe Specwrk::Worker do
     allow(Specwrk::Client).to receive(:new)
       .and_return(client, heartbeat_client)
 
-    allow(client).to receive(:fetch_examples) { %w[a.rb:1 b.rb:2].dup }
+    allow(client).to receive(:fetch_examples) { [{id: "./a_spec.rb[1:1]"}, {id: "./b_spec.rb[1:2]"}] }
 
     allow(executor).to receive(:flush_log)
 
@@ -35,6 +35,7 @@ RSpec.describe Specwrk::Worker do
       .and_yield("foo")
       .and_yield("bar")
 
+    allow($stdout).to receive(:write) # default for e.g. the blank line before a bucket footer
     allow($stdout).to receive(:write)
       .with("foo")
     allow($stdout).to receive(:write)
@@ -248,11 +249,28 @@ RSpec.describe Specwrk::Worker do
       results = [{id: "a.rb:1", status: "passed"}]
 
       expect(instance).to receive(:run_in_fork)
-        .with(%w[a.rb:1 b.rb:2])
+        .with([{id: "./a_spec.rb[1:1]"}, {id: "./b_spec.rb[1:2]"}])
         .and_return(results)
 
       expect(instance).to receive(:complete_examples)
         .with(results)
+
+      instance.execute
+    end
+
+    it "logs a bucket header with the rerun command and a footer with timing and status counts" do
+      results = [
+        {id: "./a_spec.rb[1:1]", status: "passed", run_time: 0.1},
+        {id: "./b_spec.rb[1:2]", status: "failed", run_time: 0.2}
+      ]
+
+      allow(instance).to receive(:run_in_fork).and_return(results)
+      allow(instance).to receive(:complete_examples)
+      allow(instance).to receive(:rspec_seed_options).and_return(" --seed 1234")
+
+      expect(instance).to receive(:log_ts).with("bucket 1: 2 examples from 2 files")
+      expect(instance).to receive(:log_ts).with("bucket 1 rerun: bundle exec rspec --seed 1234 './a_spec.rb[1:1]' './b_spec.rb[1:2]'")
+      expect(instance).to receive(:log_ts).with(a_string_matching(/\Abucket 1 done in \d+\.\ds: 1 passed, 1 failed, 0 pending\z/))
 
       instance.execute
     end
@@ -268,6 +286,65 @@ RSpec.describe Specwrk::Worker do
         .with("oops")
 
       instance.execute
+    end
+
+    it "accumulates example count and total spec run time in @metrics" do
+      results = [
+        {id: "a.rb:1", status: "passed", run_time: 1.5},
+        {id: "a.rb:2", status: "failed", run_time: nil} # synthesized (never actually ran); nil.to_f == 0
+      ]
+
+      allow(instance).to receive(:run_in_fork).and_return(results)
+      allow(instance).to receive(:complete_examples)
+
+      expect { instance.execute }
+        .to change { instance.metrics[:examples] }.from(0).to(2)
+
+      expect(instance.metrics[:example_time]).to eq(1.5)
+    end
+  end
+
+  describe "#rspec_command" do
+    before { allow(instance).to receive(:rspec_seed_options).and_return("") }
+
+    it "collapses same-file example ids into rspec's multi-scope bracket syntax" do
+      examples = [
+        {id: "./spec/a_spec.rb[1:1]"},
+        {id: "./spec/a_spec.rb[1:4:2]"},
+        {id: "./spec/b_spec.rb[1:2]"}
+      ]
+
+      expect(instance.send(:rspec_command, examples))
+        .to eq("bundle exec rspec './spec/a_spec.rb[1:1,1:4:2]' './spec/b_spec.rb[1:2]'")
+    end
+
+    it "keeps whole-file ids as bare paths, subsuming any scoped ids for that file" do
+      examples = [
+        {id: "./spec/a_spec.rb[1:1]"},
+        {id: "./spec/a_spec.rb"},
+        {id: "./spec/b_spec.rb"}
+      ]
+
+      expect(instance.send(:rspec_command, examples))
+        .to eq("bundle exec rspec './spec/a_spec.rb' './spec/b_spec.rb'")
+    end
+  end
+
+  describe "#rspec_seed_options" do
+    subject { instance.send(:rspec_seed_options) }
+
+    it "pins the configured seed when ordering is random, so reruns match CI's order" do
+      allow(RSpec.configuration).to receive(:seed).and_return(1234)
+
+      expect(subject).to eq(" --seed 1234")
+    end
+
+    it "is empty when ordering is not random (--seed would force random order)" do
+      registry = instance_double(RSpec::Core::Ordering::Registry)
+      allow(registry).to receive(:fetch).with(:global).and_return(RSpec::Core::Ordering::Identity.new)
+      allow(RSpec.configuration).to receive(:ordering_registry).and_return(registry)
+
+      expect(subject).to be_empty
     end
   end
 
@@ -322,6 +399,26 @@ RSpec.describe Specwrk::Worker do
     ensure
       flag&.unlink
     end
+
+    it "counts the bucket and accumulates wall time in @metrics" do
+      allow(executor).to receive(:run)
+
+      expect { instance.run_in_fork([{id: "a.rb:1", file_path: "a.rb"}]) }
+        .to change { instance.metrics[:buckets] }.from(0).to(1)
+
+      expect(instance.metrics[:bucket_wall]).to be > 0
+    end
+
+    # ensure covers the kill-on-timeout return too, not just the normal path —
+    # a hung bucket still counts against @metrics rather than vanishing from it.
+    it "still counts the bucket when the child is killed for exceeding the timeout" do
+      allow(instance).to receive(:wait_for_child).and_return(nil)
+      allow(executor).to receive(:run)
+      allow(executor).to receive(:unexecuted_failure).and_return({id: "a.rb:1", status: "failed"})
+
+      expect { instance.run_in_fork([{id: "a.rb:1", file_path: "a.rb"}]) }
+        .to change { instance.metrics[:buckets] }.from(0).to(1)
+    end
   end
 
   describe "#decode_bucket_results" do
@@ -366,6 +463,18 @@ RSpec.describe Specwrk::Worker do
       ENV["SPECWRK_PRELOAD"] = "tempfile"
 
       expect(instance).to receive(:require).with("tempfile")
+      expect(client).to receive(:reconnect)
+
+      instance.preload!
+    end
+
+    # The socket died server-side while the preload ran; a stale connection
+    # here means the first /pop logs a pointless EOFError retry.
+    it "reconnects the data client after the preload's long idle gap" do
+      ENV["SPECWRK_PRELOAD"] = "tempfile"
+
+      allow(instance).to receive(:require)
+      expect(client).to receive(:reconnect)
 
       instance.preload!
     end
@@ -374,6 +483,7 @@ RSpec.describe Specwrk::Worker do
       ENV.delete("SPECWRK_PRELOAD")
 
       expect(instance).not_to receive(:require)
+      expect(client).not_to receive(:reconnect)
 
       instance.preload!
     end
@@ -498,6 +608,53 @@ RSpec.describe Specwrk::Worker do
 
         subject
       end
+    end
+  end
+
+  describe "end-of-run summary" do
+    subject { instance.run }
+
+    before do
+      allow(Specwrk::Client).to receive(:wait_for_server!)
+      allow(instance).to receive(:execute).and_raise(Specwrk::CompletedAllExamplesError)
+      allow(client).to receive(:worker_status).and_return(0)
+
+      allow(client).to receive(:stats).and_return({
+        "/pop" => {calls: 2, duration: 1.0},
+        "/complete_and_pop" => {calls: 3, duration: 2.5}
+      })
+      allow(heartbeat_client).to receive(:stats).and_return({"/heartbeat" => {calls: 4, duration: 0.2}})
+    end
+
+    # Always on — independent of SPECWRK_RUN_SUMMARY (that gate lives on the
+    # CLI's Work command, not here), printed locally with no /report fetch.
+    it "prints a greppable end-of-run metrics summary before the coverage flush" do
+      expect(instance).to receive(:log_ts).with(a_string_matching(/\Asummary: buckets=0 examples=0/))
+      expect(instance).to receive(:log_ts).with(a_string_including("server calls=5", "complete_and_pop=3/2.5s", "heartbeat=4/0.2s"))
+      expect(instance).to receive(:log_ts).with(a_string_matching(/summary: run_wall=\d+\.\ds/))
+
+      subject
+    end
+
+    it "prints the summary before before_fork_exit! flushes coverage" do
+      expect(instance).to receive(:log_ts).with(a_string_matching(/\Asummary: buckets=/))
+      expect(instance).to receive(:log_ts).with(a_string_including("server calls="))
+      expect(instance).to receive(:log_ts).with(a_string_matching(/run_wall=/)).ordered
+      expect(Specwrk).to receive(:before_fork_exit!).ordered
+
+      subject
+    end
+
+    # This is purely diagnostic bookkeeping sitting ahead of the coverage
+    # flush in #run — a raise here must never take that flush down with it.
+    it "swallows a raise while building the summary and still runs before_fork_exit!" do
+      allow(client).to receive(:stats).and_raise("stats boom")
+      allow(instance).to receive(:warn)
+
+      expect(instance).to receive(:warn).with(a_string_including("Skipping end-of-run metrics summary", "stats boom"))
+      expect(Specwrk).to receive(:before_fork_exit!)
+
+      subject
     end
   end
 end

@@ -12,6 +12,14 @@ require "specwrk/worker/null_formatter"
 module Specwrk
   class Worker
     class Executor
+      # Resolve (and warn on a missing gem) exactly once, here in the
+      # long-lived parent before any per-bucket fork — children inherit the
+      # already-loaded gem and the memoized result instead of each repeating
+      # the require/rescue/warn dance.
+      def initialize
+        junit_formatter_class
+      end
+
       def examples
         completion_formatter.examples
       end
@@ -27,7 +35,7 @@ module Specwrk
         example_ids = examples.map { |example| example[:id] }
 
         options = RSpec::Core::ConfigurationOptions.new ["--format", "Specwrk::Worker::NullFormatter"] + example_ids
-        RSpec::Core::Runner.new(options).run($stderr, $stdout)
+        RSpec::Core::Runner.new(options).run($stderr, $stdout).tap { publish_junit! }
       end
 
       # Examples this worker was asked to run but which produced no result — e.g.
@@ -99,6 +107,8 @@ module Specwrk
         # it will be initialized by RSpec
         RSpec.configuration.add_formatter NullFormatter
 
+        add_junit_formatter!
+
         true
       end
 
@@ -129,6 +139,58 @@ module Specwrk
         return unless ENV["SPECWRK_OUT"]
 
         @json_log_file_path ||= File.join(ENV["SPECWRK_OUT"], ENV["SPECWRK_RUN"], "#{ENV["SPECWRK_FORKED"]}.ndjson")
+      end
+
+      # Adds a JUnit XML formatter for this bucket's run, gated on
+      # SPECWRK_JUNIT_DIR (for CircleCI's store_test_results). Writes go
+      # through a File we own — not a path string handed to RSpec — so
+      # #publish_junit! can close it and rename it away from workers still
+      # racing this one. Each bucket in a worker's lifetime gets its own
+      # sequence number since a worker's Executor persists across buckets.
+      def add_junit_formatter!
+        return unless junit_formatter_class
+
+        @junit_sequence = @junit_sequence.to_i + 1
+        dir = ENV.fetch("SPECWRK_JUNIT_DIR")
+        FileUtils.mkdir_p(dir)
+
+        path = File.join(dir, "rspec-#{ENV.fetch("SPECWRK_ID", "specwrk-worker")}-#{Process.pid}-#{@junit_sequence}.xml")
+        @junit_output = File.open("#{path}.inprogress", "w")
+
+        RSpec.configuration.add_formatter junit_formatter_class.new(@junit_output)
+      end
+
+      # Auxiliary reporting only — authoritative pass/fail results stay the
+      # queue/exit-code path. A missing gem warns once and is otherwise
+      # silently skipped, never fails the bucket.
+      def junit_formatter_class
+        return @junit_formatter_class if defined?(@junit_formatter_class)
+
+        @junit_formatter_class = if ENV["SPECWRK_JUNIT_DIR"]
+          begin
+            require "rspec_junit_formatter"
+            RSpecJUnitFormatter
+          rescue LoadError
+            warn "SPECWRK_JUNIT_DIR is set but the rspec_junit_formatter gem is not available (add it to your Gemfile); skipping JUnit output"
+            nil
+          end
+        end
+      end
+
+      # Closing the formatter's IO flushes RSpecJUnitFormatter's dump_summary
+      # output, then the file is renamed into place so CircleCI's *.xml glob
+      # never sees a partial file. Called only on a normal return from the
+      # runner (see #run) — a raise (e.g. a SPECWRK_BUCKET_TIMEOUT kill)
+      # abandons the .inprogress file instead of publishing a truncated one.
+      def publish_junit!
+        return unless @junit_output
+
+        inprogress_path = @junit_output.path
+        @junit_output.close
+        File.rename(inprogress_path, inprogress_path.delete_suffix(".inprogress"))
+        @junit_output = nil
+      rescue => e
+        warn "specwrk: failed to write JUnit XML: #{e.class}: #{e.message}"
       end
     end
   end

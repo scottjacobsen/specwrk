@@ -2,8 +2,10 @@
 
 require "uri"
 require "net/http"
+require "openssl"
 require "json"
 require "securerandom"
+require "time"
 
 require "specwrk"
 
@@ -19,7 +21,7 @@ module Specwrk
       http.finish
 
       true
-    rescue Errno::ECONNREFUSED, Errno::EHOSTUNREACH
+    rescue Errno::ECONNREFUSED, Errno::EHOSTUNREACH, OpenSSL::SSL::SSLError
       false
     end
 
@@ -27,6 +29,11 @@ module Specwrk
       uri = URI(ENV.fetch("SPECWRK_SRV_URI", "http://localhost:5138"))
       Specwrk.net_http.new(uri.host, uri.port).tap do |http|
         http.use_ssl = uri.scheme == "https"
+        # Self-signed server certs (e.g. a local/CI-only server): skip
+        # verification rather than failing every connection. Gated on
+        # use_ssl? so a plain-http connection never carries a misleading
+        # verify_mode.
+        http.verify_mode = OpenSSL::SSL::VERIFY_NONE if http.use_ssl? && ENV["SPECWRK_SSL_NO_VERIFY"]
         http.open_timeout = ENV.fetch("SPECWRK_TIMEOUT", "5").to_i
         http.read_timeout = ENV.fetch("SPECWRK_TIMEOUT", "5").to_i
         http.keep_alive_timeout = 300
@@ -45,17 +52,34 @@ module Specwrk
       raise Errno::ECONNREFUSED unless connected
     end
 
-    attr_reader :last_request_at, :retry_count, :worker_status
+    attr_reader :last_request_at, :retry_count, :worker_status, :stats
 
-    def initialize
+    # log_requests: emit one timestamped line per HTTP attempt (method, path,
+    # response code, duration). On for a worker's data client so CI output
+    # shows exactly when the server was called and what it cost; off for the
+    # heartbeat client, which would otherwise add a line every ~10s.
+    def initialize(log_requests: false)
+      @log_requests = log_requests
       @mutex = Mutex.new
       @http = self.class.build_http
       @http.start
       @worker_status = 1
+      # Per-instance, keyed by request path ("/pop" etc — paths ARE the
+      # endpoint names). make_request already holds @mutex for the whole
+      # attempt loop, so writes here are lock-free-safe.
+      @stats = Hash.new { |h, path| h[path] = {calls: 0, duration: 0.0} }
     end
 
     def close
       @mutex.synchronize { @http.finish }
+    end
+
+    # For long idle gaps the caller knows about (e.g. a minutes-long app
+    # preload): the server drops the keep-alive socket well before then, so
+    # the next request would pay a logged EOFError retry. Reconnecting up
+    # front keeps that noise out of the output.
+    def reconnect
+      @mutex.synchronize { reconnect! }
     end
 
     def heartbeat
@@ -170,13 +194,22 @@ module Specwrk
     # @http gets torn down and rebuilt while still exclusively held.
     def make_request(request)
       @mutex.synchronize do
+        # Re-stamped on every retry: `retry` re-enters right here, at the top
+        # of the block, so each attempt gets its own start time.
+        attempt_started_at = Process.clock_gettime(Process::CLOCK_MONOTONIC)
         @last_request_at = Time.now
         @http.request(request).tap do |response|
           @retry_count = 0
+          record_attempt(request.path, attempt_started_at)
+          log_attempt(request, response.code, attempt_started_at)
 
           @worker_status = response["x-specwrk-status"].to_i if response["x-specwrk-status"]
         end
       rescue Net::ReadTimeout, Net::WriteTimeout => e
+        # `ensure` does not run on `retry`, so record explicitly here rather
+        # than relying on an ensure to cover every attempt.
+        record_attempt(request.path, attempt_started_at)
+        log_attempt(request, e.class, attempt_started_at)
         retry_or_raise!(e)
         retry
       rescue Errno::ECONNRESET, Errno::EPIPE, IOError => e
@@ -187,10 +220,31 @@ module Specwrk
         # (IOError covers EOFError, a subclass) instead of a clean refusal.
         # Reconnect before retrying so the retry isn't doomed to hit the same
         # dead socket again.
+        record_attempt(request.path, attempt_started_at)
+        log_attempt(request, e.class, attempt_started_at)
         retry_or_raise!(e)
         reconnect!
         retry
       end
+    end
+
+    def record_attempt(path, started_at)
+      entry = @stats[path]
+      entry[:calls] += 1
+      entry[:duration] += Process.clock_gettime(Process::CLOCK_MONOTONIC) - started_at
+    end
+
+    # Retries log one line each (outcome is the exception class), so a
+    # timing-out server shows up as N slow attempts rather than one opaque
+    # multi-second gap in the worker's output.
+    def log_attempt(request, outcome, started_at)
+      return unless @log_requests
+
+      duration = Process.clock_gettime(Process::CLOCK_MONOTONIC) - started_at
+      $stdout.puts format("[%s] %s: %s %s -> %s in %.2fs",
+        Time.now.utc.iso8601, ENV.fetch("SPECWRK_ID", "specwrk-client"),
+        request.method, request.path, outcome, duration)
+      $stdout.flush
     end
 
     def retry_or_raise!(e)

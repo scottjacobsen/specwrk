@@ -1,5 +1,7 @@
 # frozen_string_literal: true
 
+require "openssl"
+
 require "specwrk/client"
 
 RSpec.describe Specwrk::Client do
@@ -56,6 +58,14 @@ RSpec.describe Specwrk::Client do
 
       it { is_expected.to be false }
     end
+
+    context "when the handshake fails (e.g. an http/https scheme mismatch)" do
+      before do
+        allow_any_instance_of(Net::HTTP).to receive(:start).and_raise(OpenSSL::SSL::SSLError)
+      end
+
+      it { is_expected.to be false }
+    end
   end
 
   describe ".build_http" do
@@ -79,6 +89,34 @@ RSpec.describe Specwrk::Client do
         let(:base_uri) { "https://example.com" }
 
         it { is_expected.to eq(true) }
+      end
+    end
+
+    context "verify_mode" do
+      subject { described_class.build_http.verify_mode }
+
+      context "https URI with SPECWRK_SSL_NO_VERIFY set" do
+        let(:base_uri) { "https://example.com" }
+
+        before { stub_const("ENV", ENV.to_h.merge("SPECWRK_SSL_NO_VERIFY" => "1")) }
+
+        it { is_expected.to eq(OpenSSL::SSL::VERIFY_NONE) }
+      end
+
+      context "https URI, knob unset" do
+        let(:base_uri) { "https://example.com" }
+
+        it { is_expected.to be_nil } # Net::HTTP's default
+      end
+
+      # Gated on use_ssl? so plain-http connections never carry a misleading
+      # verify_mode.
+      context "http URI with SPECWRK_SSL_NO_VERIFY set" do
+        let(:base_uri) { "http://example.com" }
+
+        before { stub_const("ENV", ENV.to_h.merge("SPECWRK_SSL_NO_VERIFY" => "1")) }
+
+        it { is_expected.to be_nil }
       end
     end
 
@@ -190,6 +228,72 @@ RSpec.describe Specwrk::Client do
       end
 
       it { is_expected.to be false }
+    end
+  end
+
+  describe "#stats" do
+    subject { client.stats }
+
+    let(:client) { described_class.new }
+
+    before do
+      stub_request(:post, "#{base_uri}/pop")
+        .with(headers: headers)
+        .to_return(status: 200, body: "[]")
+
+      stub_request(:get, "#{base_uri}/heartbeat")
+        .with(headers: headers)
+        .to_return(status: 200)
+    end
+
+    it "records call counts and durations per endpoint path" do
+      client.fetch_examples
+      client.heartbeat
+      client.heartbeat
+
+      expect(subject.keys).to contain_exactly("/pop", "/heartbeat")
+      expect(subject["/pop"][:calls]).to eq(1)
+      expect(subject["/pop"][:duration]).to be_a(Float).and(be >= 0)
+      expect(subject["/heartbeat"][:calls]).to eq(2)
+    end
+  end
+
+  describe "#reconnect" do
+    let(:client) { described_class.new }
+
+    it "cycles the connection and requests still work afterwards" do
+      stub_request(:post, "#{base_uri}/pop")
+        .with(headers: headers)
+        .to_return(status: 200, body: "[]")
+
+      client.reconnect
+
+      expect(client.fetch_examples).to eq([])
+    end
+  end
+
+  describe "request logging" do
+    before do
+      stub_request(:post, "#{base_uri}/pop")
+        .with(headers: headers)
+        .to_return(status: 200, body: "[]")
+    end
+
+    it "logs one timestamped line per request when log_requests is on" do
+      client = described_class.new(log_requests: true)
+
+      expect($stdout).to receive(:puts)
+        .with(a_string_matching(%r{\A\[\d{4}-\d{2}-\d{2}T.+\] .+: POST /pop -> 200 in \d+\.\d\ds\z}))
+
+      client.fetch_examples
+    end
+
+    it "stays quiet by default" do
+      client = described_class.new
+
+      expect($stdout).not_to receive(:puts)
+
+      client.fetch_examples
     end
   end
 
@@ -341,6 +445,26 @@ RSpec.describe Specwrk::Client do
 
         expect(subject).to eq(examples)
         expect(client.retry_count).to eq(0)
+        expect(client.stats["/complete_and_pop"][:calls]).to eq(3) # 2 failed attempts + the successful one
+      end
+    end
+
+    context "when a connection-reset error happens once then succeeds" do
+      let(:examples) { [{id: 3, name: "reset-recovered example"}] }
+
+      before do
+        stub_request(:post, "#{base_uri}/complete_and_pop")
+          .with(headers: headers)
+          .to_raise(Errno::ECONNRESET).then
+          .to_return(status: 200, body: examples.to_json)
+
+        allow(client).to receive(:warn)
+        allow(client).to receive(:sleep)
+      end
+
+      it "counts both attempts in stats" do
+        expect(subject).to eq(examples)
+        expect(client.stats["/complete_and_pop"][:calls]).to eq(2)
       end
     end
 
