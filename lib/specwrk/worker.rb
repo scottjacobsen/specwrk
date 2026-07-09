@@ -21,6 +21,7 @@ module Specwrk
 
       @running = true
       @client = Client.new
+      @heartbeat_client = Client.new
       @executor = Executor.new
       @all_examples_completed = false
       @seed_waits = ENV.fetch("SPECWRK_SEED_WAITS", "10").to_i
@@ -71,6 +72,7 @@ module Specwrk
 
       @heartbeat_thread.kill
       client.close
+      heartbeat_client.close
 
       # The parent hard-exits via the init script (Process.exit! — at_exit is
       # unsafe in a booted app), and forked children get ZEROED Coverage
@@ -212,12 +214,16 @@ module Specwrk
       end
     end
 
+    # Heartbeats run over their own connection (@heartbeat_client), never the
+    # data client (@client): a stalled complete_and_pop request that blocks on
+    # the shared connection must not also block the heartbeat that keeps this
+    # worker's in-flight bucket from being falsely reclaimed as expired.
     def thump
       while running && !Specwrk.force_quit
         sleep 10
 
         begin
-          client.heartbeat if client.last_request_at.nil? || client.last_request_at < Time.now - 9
+          heartbeat_client.heartbeat if client.last_request_at.nil? || client.last_request_at < Time.now - 9
         rescue
           warn "Heartbeat failed!"
         end
@@ -226,7 +232,7 @@ module Specwrk
 
     private
 
-    attr_reader :running, :client, :executor
+    attr_reader :running, :client, :heartbeat_client, :executor
 
     # Flush the child's accumulated failure/pending summary back to the worker's
     # output stream. Children run sequentially (the parent waits on each), so

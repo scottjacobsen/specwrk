@@ -7,7 +7,7 @@ module Specwrk
     module Endpoints
       class Pop < Popable
         def with_response
-          with_pop_response
+          idempotent { with_pop_response }
         end
       end
     end

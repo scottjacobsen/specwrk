@@ -9,20 +9,22 @@ module Specwrk
         EXAMPLE_STATUSES = %w[passed failed pending]
 
         def with_response
-          retry_examples # pre-calculate before lock
+          idempotent do
+            retry_examples # pre-calculate before lock
 
-          with_lock do
-            pending.reload
-            processing.delete(*(completed_examples.keys + retry_examples.keys))
-            pending.merge!(retry_examples)
+            with_lock do
+              pending.reload
+              processing.delete(*(completed_examples.keys + retry_examples.keys))
+              pending.merge!(retry_examples)
+            end
+
+            completed.merge!(completed_examples)
+            failure_counts.merge!(retry_examples_new_failure_counts)
+
+            update_run_times
+
+            with_pop_response
           end
-
-          completed.merge!(completed_examples)
-          failure_counts.merge!(retry_examples_new_failure_counts)
-
-          update_run_times
-
-          with_pop_response
         end
 
         private

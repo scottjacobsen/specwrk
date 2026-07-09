@@ -4,6 +4,7 @@ require "specwrk/worker"
 
 RSpec.describe Specwrk::Worker do
   let(:client) { instance_double(Specwrk::Client, close: true) }
+  let(:heartbeat_client) { instance_double(Specwrk::Client, close: true) }
   let(:tempfile) { instance_double(Tempfile, rewind: true) }
   let(:thread) { instance_double(Thread, kill: true) }
 
@@ -18,7 +19,7 @@ RSpec.describe Specwrk::Worker do
 
   before do
     allow(Specwrk::Client).to receive(:new)
-      .and_return(client)
+      .and_return(client, heartbeat_client)
 
     allow(client).to receive(:fetch_examples) { %w[a.rb:1 b.rb:2].dup }
 
@@ -399,8 +400,9 @@ RSpec.describe Specwrk::Worker do
         allow(client).to receive(:last_request_at)
           .and_return(nil)
 
-        expect(client).to receive(:heartbeat)
+        expect(heartbeat_client).to receive(:heartbeat)
           .and_return(true)
+        expect(client).not_to receive(:heartbeat)
 
         expect { instance.thump }.to raise_error("Boom")
       end
@@ -409,7 +411,7 @@ RSpec.describe Specwrk::Worker do
         allow(client).to receive(:last_request_at)
           .and_return(Time.now - 1)
 
-        expect(client).not_to receive(:heartbeat)
+        expect(heartbeat_client).not_to receive(:heartbeat)
 
         expect { instance.thump }.to raise_error("Boom")
       end
@@ -418,8 +420,9 @@ RSpec.describe Specwrk::Worker do
         allow(client).to receive(:last_request_at)
           .and_return(Time.now - 9)
 
-        expect(client).to receive(:heartbeat)
+        expect(heartbeat_client).to receive(:heartbeat)
           .and_return(true)
+        expect(client).not_to receive(:heartbeat)
 
         expect { instance.thump }.to raise_error("Boom")
       end
@@ -428,7 +431,7 @@ RSpec.describe Specwrk::Worker do
         allow(client).to receive(:last_request_at)
           .and_return(nil)
 
-        expect(client).to receive(:heartbeat)
+        expect(heartbeat_client).to receive(:heartbeat)
           .and_raise("Bang!")
 
         expect(instance).to receive(:warn)
@@ -449,7 +452,7 @@ RSpec.describe Specwrk::Worker do
 
       it "does not heartbeat" do
         expect(client).not_to receive(:last_request_at)
-        expect(client).not_to receive(:heartbeat)
+        expect(heartbeat_client).not_to receive(:heartbeat)
 
         instance.thump
       end
@@ -466,9 +469,34 @@ RSpec.describe Specwrk::Worker do
 
       it "does not heartbeat" do
         expect(client).not_to receive(:last_request_at)
-        expect(client).not_to receive(:heartbeat)
+        expect(heartbeat_client).not_to receive(:heartbeat)
 
         instance.thump
+      end
+    end
+  end
+
+  describe "heartbeat connection isolation" do
+    it "opens a dedicated Client instance for heartbeats, separate from the data client" do
+      instance
+
+      expect(Specwrk::Client).to have_received(:new).twice
+    end
+
+    context "#run" do
+      subject { instance.run }
+
+      before do
+        allow(Specwrk::Client).to receive(:wait_for_server!)
+        allow(instance).to receive(:execute).and_raise(Specwrk::CompletedAllExamplesError)
+        allow(client).to receive(:worker_status).and_return(0)
+      end
+
+      it "closes both the data client and the heartbeat client" do
+        expect(client).to receive(:close)
+        expect(heartbeat_client).to receive(:close)
+
+        subject
       end
     end
   end

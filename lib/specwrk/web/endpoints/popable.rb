@@ -10,6 +10,28 @@ module Specwrk
 
         private
 
+        # /pop and /complete_and_pop each both mutate state AND hand out a
+        # bucket, so they cannot be safely retried — yet the client retries
+        # them when a response is lost mid-flight (e.g. connection reset after
+        # the server finished processing). Without this, the retry of a request
+        # the server already handled would run the endpoint AGAIN: the same
+        # results double-tallied and, worse, a second bucket shifted to the
+        # worker while the first sits orphaned in processing under its name —
+        # heartbeat-alive, so never reclaimed. Record each response against the
+        # client-sent request id and replay it verbatim for a duplicate.
+        def idempotent
+          return yield if request_id.empty?
+
+          replay = worker.replayable_response(request_id)
+          return replay if replay
+
+          yield.tap { |response| worker.record_response!(request_id, response) }
+        end
+
+        def request_id
+          @request_id ||= request.get_header("HTTP_X_SPECWRK_REQUEST_ID").to_s
+        end
+
         def with_pop_response
           if examples.any?
             [200, {"content-type" => "application/json"}, [JSON.generate(examples)]]
@@ -29,7 +51,7 @@ module Specwrk
               # worker polls again, rather than 200 it an empty array.
               not_found
             end
-          elsif completed.any? && pending.length.zero?
+          elsif completed.any? && pending.length.zero? && !stale_in_flight_work?
             # The bucket queue is drained and there's nothing to reclaim, so there
             # is no more work to hand out: tell the worker to go home. This used to
             # require processing.empty?, but a straggler left in processing (whose
@@ -39,6 +61,13 @@ module Specwrk
             # timeout. Keying off the drained queue instead terminates cleanly;
             # any worker still running a bucket finishes and gets this on its next
             # request (its results are recorded before this response).
+            #
+            # stale_in_flight_work? carves out the dead-worker case: 410 is
+            # terminal, so if in-flight work belongs to a worker that has stopped
+            # heartbeating and everyone else goes home before the expiry scan
+            # requeues it, nobody is left to run it and the run "drains" with
+            # examples that never ran. 404 instead keeps the pollers around until
+            # a scan reclaims the bucket and hands it back out.
             [410, {"content-type" => "text/plain"}, ["That's a good lad. Run along now and go home."]]
           else
             not_found
@@ -101,6 +130,18 @@ module Specwrk
 
         def expiry_check_due?
           Time.now.to_i - (metadata[LAST_EXPIRY_CHECK_AT_KEY] || 0) >= expiry_check_interval
+        end
+
+        # In-flight work owned by a worker that has missed its heartbeats. Such
+        # work is (or is about to be) reclaimable, so the drained-queue 410 must
+        # not send the remaining pollers home past it. Live owners don't count:
+        # their buckets finish on their own and must not hold up the drain.
+        # Deliberately NOT gated by expiry_check_due? — this read-only check is
+        # what bridges the gap between two interval-gated reclaim scans.
+        def stale_in_flight_work?
+          return false if processing.empty?
+
+          processing.reload.to_h.any? { |_id, example| expired?(example) }
         end
 
         # How often (seconds) the processing set is scanned for expired examples

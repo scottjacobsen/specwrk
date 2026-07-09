@@ -241,6 +241,41 @@ RSpec.describe Specwrk::Client do
     end
   end
 
+  describe "request ids on non-idempotent endpoints" do
+    let(:client) { described_class.new }
+
+    it "sends a fresh x-specwrk-request-id per logical /pop call" do
+      seen_ids = []
+      stub_request(:post, "#{base_uri}/pop")
+        .with { |req| seen_ids << req.headers["X-Specwrk-Request-Id"] }
+        .to_return(status: 200, body: "[]")
+
+      client.fetch_examples
+      client.fetch_examples
+
+      expect(seen_ids.length).to eq(2)
+      expect(seen_ids).to all(match(/\A\h{8}-/))
+      expect(seen_ids.uniq.length).to eq(2)
+    end
+
+    it "reuses the same request id across retries of one logical call, so the server can replay" do
+      seen_ids = []
+      stub_request(:post, "#{base_uri}/complete_and_pop")
+        .with { |req| seen_ids << req.headers["X-Specwrk-Request-Id"] }
+        .to_raise(EOFError).then
+        .to_return(status: 200, body: "[]")
+
+      allow(client).to receive(:warn)
+      allow(client).to receive(:sleep)
+
+      client.complete_and_fetch_examples([{id: 1}])
+
+      expect(seen_ids.length).to eq(2)
+      expect(seen_ids).to all(match(/\A\h{8}-/)) # present on every attempt, not just the first
+      expect(seen_ids.uniq.length).to eq(1)
+    end
+  end
+
   describe "#complete_and_fetch_examples" do
     subject { client.complete_and_fetch_examples(payload) }
 
@@ -321,6 +356,55 @@ RSpec.describe Specwrk::Client do
         expect(client).to receive(:sleep).exactly(5).times
 
         expect { subject }.to raise_error(Net::ReadTimeout)
+      end
+    end
+
+    # Puma (or any server-side idle timeout) can close a keep-alive connection
+    # this client is still holding open — e.g. while it sits idle through a
+    # multi-minute app preload, or through a long-running bucket. Net::HTTP
+    # does not auto-retry a POST on a dead keep-alive socket (only idempotent
+    # methods get that), so reusing it surfaces as EOFError/ECONNRESET/EPIPE/
+    # IOError rather than a clean refusal, and a bare retry would just hit the
+    # same dead socket again.
+    context "when the keep-alive connection was closed server-side and the request raises EOFError once, then succeeds" do
+      let(:examples) { [{id: 2, name: "reconnected example"}] }
+
+      before do
+        stub_request(:post, "#{base_uri}/complete_and_pop")
+          .with(headers: headers)
+          .to_raise(EOFError).then
+          .to_return(status: 200, body: examples.to_json)
+      end
+
+      it "reconnects (finish then start) before retrying, returns the parsed body, and resets the retry count" do
+        http = client.send(:instance_variable_get, :@http)
+
+        expect(client).to receive(:warn).once
+        expect(client).to receive(:sleep).once
+        expect(http).to receive(:finish).ordered.and_call_original
+        expect(http).to receive(:start).ordered.and_call_original
+
+        expect(subject).to eq(examples)
+        expect(client.retry_count).to eq(0)
+      end
+    end
+
+    context "when the connection keeps dying across every retry" do
+      before do
+        stub_request(:post, "#{base_uri}/complete_and_pop")
+          .with(headers: headers)
+          .to_raise(EOFError)
+      end
+
+      it "reconnects and warns each time, then re-raises the original error once retries are exhausted" do
+        http = client.send(:instance_variable_get, :@http)
+
+        expect(client).to receive(:warn).exactly(5).times
+        expect(client).to receive(:sleep).exactly(5).times
+        expect(http).to receive(:finish).exactly(5).times.and_call_original
+        expect(http).to receive(:start).exactly(5).times.and_call_original
+
+        expect { subject }.to raise_error(EOFError)
       end
     end
   end

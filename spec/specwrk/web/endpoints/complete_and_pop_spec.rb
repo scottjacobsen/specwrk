@@ -48,6 +48,53 @@ RSpec.describe Specwrk::Web::Endpoints::CompleteAndPop do
     it { expect { subject }.to change { worker["pending"] }.from(nil).to(1) }
   end
 
+  context "a retried completion whose first response was lost (same x-specwrk-request-id)" do
+    # The retry must replay the recorded response, not run the endpoint again —
+    # a re-run hands out a SECOND bucket (the completion half is already deduped
+    # by the processing_examples guard, but the pop half is not), leaving the
+    # first bucket orphaned in processing under this worker's name,
+    # heartbeat-alive and unreclaimable.
+    let(:env_vars) { super().merge("SPECWRK_SRV_GROUP_BY" => "file") }
+
+    let(:existing_processing_data) do
+      {
+        "a.rb:1": {id: "a.rb:1", file_path: "a.rb", expected_run_time: 0.1},
+        "a.rb:3": {id: "a.rb:3", file_path: "a.rb", expected_run_time: 0.1},
+        "a.rb:4": {id: "a.rb:4", file_path: "a.rb", expected_run_time: 0.1},
+        "a.rb:5": {id: "a.rb:5", file_path: "a.rb", expected_run_time: 0.1}
+      }
+    end
+
+    let(:existing_pending_data) do
+      {
+        "b.rb:1": {id: "b.rb:1", file_path: "b.rb", expected_run_time: 0.1},
+        "c.rb:1": {id: "c.rb:1", file_path: "c.rb", expected_run_time: 0.1}
+      }
+    end
+
+    def response_for(request_id)
+      request_env = env.merge(
+        "HTTP_X_SPECWRK_REQUEST_ID" => request_id,
+        "rack.input" => StringIO.new(body)
+      )
+      described_class.new(Rack::Request.new(request_env)).response
+    end
+
+    it "replays the recorded response instead of completing again and handing out a second bucket" do
+      first = response_for("req-1")
+      expect(first[0]).to eq(200)
+      expect(worker.reload["passed"]).to eq(2)
+      expect(completed.reload.length).to eq(4)
+      expect(pending.reload.length).to eq(1) # one bucket handed out, one left
+
+      replay = response_for("req-1")
+      expect(replay[0]).to eq(200)
+      expect(replay[2]).to eq(first[2]) # the same bucket, not the remaining one
+      expect(worker.reload["passed"]).to eq(2) # not double-tallied
+      expect(pending.reload.length).to eq(1) # the remaining bucket was NOT also handed out
+    end
+  end
+
   context "completes examples that never actually ran" do
     let(:body) {
       JSON.generate([
@@ -157,6 +204,96 @@ RSpec.describe Specwrk::Web::Endpoints::CompleteAndPop do
     it { is_expected.to eq([200, {"content-type" => "application/json", "x-specwrk-status" => "1"}, [response_body]]) }
     it { expect { subject }.to change { processing.reload.length }.from(4).to(2) }
     it { expect { subject }.to change { failure_counts.reload.to_h.values }.from(match_array([1, 5])).to(match_array([2, 5, 1])) }
+  end
+
+  # These three isolate the individual retry ↔ exit-code guarantees (the
+  # mixed-payload "retries examples" context above already covers the shape
+  # of a request with several statuses at once). We're about to enable
+  # --max-retries 1 in CI, so a retried failure must never taint the worker's
+  # x-specwrk-status: the server-side tallies (worker[:failed], completed)
+  # must exclude examples that are still eligible for another attempt.
+  context "a retried failure does not mark the worker failed" do
+    let(:existing_failure_counts_data) { {} }
+    let(:existing_processing_data) do
+      {"a.rb:1": {id: "a.rb:1", file_path: "a.rb", expected_run_time: 0.1}}
+    end
+    let(:body) do
+      JSON.generate([{id: "a.rb:1", file_path: "a.rb", expected_run_time: 0.1, status: "failed"}])
+    end
+
+    before { pending.max_retries = 1 }
+
+    it "requeues the example, leaves completed untouched, and reports a clean exit status" do
+      subject
+
+      expect(response[0]).to eq(200)
+      body_examples = JSON.parse(response[2].first, symbolize_names: true)
+      expect(body_examples.map { |example| example[:id] }).to eq(["a.rb:1"])
+      expect(response[1]["x-specwrk-status"]).to eq("0")
+
+      expect(worker.reload["failed"]).to eq(0)
+      expect(completed.reload).to be_empty
+    end
+  end
+
+  context "a flake round-trips to green across two sequential requests from the same worker" do
+    let(:existing_failure_counts_data) { {} }
+    let(:existing_processing_data) do
+      {"a.rb:1": {id: "a.rb:1", file_path: "a.rb", expected_run_time: 0.1}}
+    end
+
+    before { pending.max_retries = 1 }
+
+    # A fresh Rack::Request/endpoint instance per request — same worker_id and
+    # run_id (env only swaps the body) — mirroring two real, sequential
+    # complete_and_pop calls from the one worker process that picked the
+    # bucket back up after its first (failed) attempt was requeued.
+    def complete_and_pop(body_json)
+      described_class.new(Rack::Request.new(env.merge("rack.input" => StringIO.new(body_json)))).response
+    end
+
+    it "ends green: completed has exactly one passed entry and the worker is never marked failed" do
+      first_body = JSON.generate([{id: "a.rb:1", file_path: "a.rb", expected_run_time: 0.1, status: "failed"}])
+      first_response = complete_and_pop(first_body)
+
+      # The requeued example comes right back in the same response — nothing
+      # else is pending — so the same worker's next bucket is its own retry.
+      expect(first_response[0]).to eq(200)
+      requeued_ids = JSON.parse(first_response[2].first, symbolize_names: true).map { |example| example[:id] }
+      expect(requeued_ids).to eq(["a.rb:1"])
+
+      second_body = JSON.generate([{id: "a.rb:1", file_path: "a.rb", expected_run_time: 0.1, status: "passed"}])
+      second_response = complete_and_pop(second_body)
+
+      expect(completed.reload.length).to eq(1)
+      expect(completed["a.rb:1"][:status]).to eq("passed")
+      expect(worker.reload["failed"]).to eq(0)
+      expect(second_response[1]["x-specwrk-status"]).to eq("0")
+    end
+  end
+
+  context "a retry-exhausted failure is red exactly once" do
+    let(:existing_failure_counts_data) { {"a.rb:1" => 5} }
+    let(:existing_processing_data) do
+      {"a.rb:1": {id: "a.rb:1", file_path: "a.rb", expected_run_time: 0.1}}
+    end
+    let(:body) do
+      JSON.generate([{id: "a.rb:1", file_path: "a.rb", expected_run_time: 0.1, status: "failed"}])
+    end
+
+    before { pending.max_retries = 5 }
+
+    it "is not requeued, is completed exactly once, and marks the worker failed" do
+      subject
+
+      expect(response[0]).to eq(410)
+      expect(response[1]["x-specwrk-status"]).to eq("1")
+
+      expect(pending.reload.length).to eq(0)
+      expect(completed.reload.length).to eq(1)
+      expect(completed["a.rb:1"][:status]).to eq("failed")
+      expect(worker.reload["failed"]).to eq(1)
+    end
   end
 
   context "a second PendingStore instance writes a bucket while this endpoint's own pending is memoized stale" do

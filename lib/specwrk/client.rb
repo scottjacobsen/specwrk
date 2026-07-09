@@ -3,6 +3,7 @@
 require "uri"
 require "net/http"
 require "json"
+require "securerandom"
 
 require "specwrk"
 
@@ -84,7 +85,7 @@ module Specwrk
     end
 
     def fetch_examples
-      response = post "/pop"
+      response = post "/pop", headers: idempotency_headers
 
       case response.code
       when "200"
@@ -101,7 +102,7 @@ module Specwrk
     end
 
     def complete_and_fetch_examples(examples)
-      response = post "/complete_and_pop", body: examples.to_json
+      response = post "/complete_and_pop", body: examples.to_json, headers: idempotency_headers
 
       case response.code
       when "200"
@@ -124,6 +125,16 @@ module Specwrk
     end
 
     private
+
+    # /pop and /complete_and_pop are non-idempotent (one request both records
+    # results and hands out the next bucket), yet make_request retries them
+    # when a response is lost mid-flight. A fresh id per LOGICAL call — reused
+    # verbatim across that call's retries, since the Net::HTTP request object
+    # is built once — lets the server recognize a duplicate and replay its
+    # recorded response instead of processing the request twice.
+    def idempotency_headers
+      default_headers.merge("x-specwrk-request-id" => SecureRandom.uuid)
+    end
 
     def get(path, headers: default_headers, body: nil)
       request = Specwrk.net_http::Get.new(path, headers)
@@ -153,6 +164,10 @@ module Specwrk
       make_request(request)
     end
 
+    # The retry loop lives INSIDE @mutex.synchronize (unlike a plain rescue on
+    # the method, which would release the mutex between attempts) so a
+    # reconnect can never race another thread's request on this same client:
+    # @http gets torn down and rebuilt while still exclusively held.
     def make_request(request)
       @mutex.synchronize do
         @last_request_at = Time.now
@@ -161,8 +176,24 @@ module Specwrk
 
           @worker_status = response["x-specwrk-status"].to_i if response["x-specwrk-status"]
         end
+      rescue Net::ReadTimeout, Net::WriteTimeout => e
+        retry_or_raise!(e)
+        retry
+      rescue Errno::ECONNRESET, Errno::EPIPE, IOError => e
+        # A keep-alive connection Puma (or another server-side idle timeout)
+        # closed while this client held it open goes undetected until the next
+        # request tries to reuse it: Net::HTTP only auto-retries idempotent
+        # methods on a dead keep-alive socket, so a POST surfaces one of these
+        # (IOError covers EOFError, a subclass) instead of a clean refusal.
+        # Reconnect before retrying so the retry isn't doomed to hit the same
+        # dead socket again.
+        retry_or_raise!(e)
+        reconnect!
+        retry
       end
-    rescue Net::ReadTimeout, Net::WriteTimeout => e
+    end
+
+    def retry_or_raise!(e)
       @retry_count ||= 0
 
       raise e if @retry_count == ENV["SPECWRK_NETWORK_RETRIES"].to_i
@@ -170,8 +201,14 @@ module Specwrk
 
       warn e
       sleep @retry_count
+    end
 
-      retry
+    def reconnect!
+      @http.finish
+    rescue
+      nil
+    ensure
+      @http.start
     end
 
     def default_headers
