@@ -42,13 +42,13 @@ module Specwrk
       @bucket_ids ||= self[BUCKET_IDS_KEY] || []
     end
 
-    def merge!(hash)
+    def merge!(hash, prepend: false)
       return self if hash.nil? || hash.empty?
 
       buckets = grouped_examples(hash.values)
       new_bucket_ids = buckets.map { |examples| write_bucket(examples) }
 
-      self.bucket_ids = bucket_ids + new_bucket_ids
+      self.bucket_ids = prepend ? new_bucket_ids + bucket_ids : bucket_ids + new_bucket_ids
       self
     end
 
@@ -71,14 +71,6 @@ module Specwrk
       bucket_id = bucket_ids.first
       self.bucket_ids = bucket_ids.drop(1)
       bucket_id
-    end
-
-    def push_examples(examples)
-      return self if examples.nil? || examples.empty?
-
-      new_bucket_id = write_bucket(examples)
-      self.bucket_ids = bucket_ids + [new_bucket_id]
-      self
     end
 
     def bucket_store_for(bucket_id)

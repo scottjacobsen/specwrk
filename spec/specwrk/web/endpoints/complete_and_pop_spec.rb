@@ -158,4 +158,49 @@ RSpec.describe Specwrk::Web::Endpoints::CompleteAndPop do
     it { expect { subject }.to change { processing.reload.length }.from(4).to(2) }
     it { expect { subject }.to change { failure_counts.reload.to_h.values }.from(match_array([1, 5])).to(match_array([2, 5, 1])) }
   end
+
+  context "a second PendingStore instance writes a bucket while this endpoint's own pending is memoized stale" do
+    let(:existing_processing_data) do
+      {"a.rb:1": {id: "a.rb:1", file_path: "a.rb", expected_run_time: 0.1}}
+    end
+
+    let(:body) do
+      JSON.generate([
+        {id: "a.rb:1", file_path: "a.rb", expected_run_time: 0.1, status: "failed"}
+      ])
+    end
+
+    let(:interloper_example) { {"b.rb:1": {id: "b.rb:1", file_path: "b.rb"}} }
+
+    before do
+      pending.max_retries = 5
+
+      # `retry_examples` is pre-calculated before the lock (with_response's
+      # first line). Force this endpoint's own PendingStore#bucket_ids to
+      # memoize empty right there — mirroring the early read Popable#examples
+      # does via `pending.length.zero?` — then have a second instance write a
+      # bucket before the lock section runs. Without `pending.reload` at the
+      # top of that lock (complete_and_pop.rb), requeuing the retry would
+      # merge against this endpoint's now-stale [] and silently clobber the
+      # concurrent write.
+      injected = false
+      allow(instance).to receive(:retry_examples).and_wrap_original do |original|
+        unless injected
+          injected = true
+          instance.send(:pending).bucket_ids
+          pending.merge!(interloper_example)
+        end
+        original.call
+      end
+    end
+
+    it "does not clobber the concurrently-written bucket when it requeues the retry" do
+      subject
+
+      response_ids = JSON.parse(response[2].first, symbolize_names: true).map { |example| example[:id] }
+      pending_ids = pending.reload.bucket_ids.flat_map { |bucket_id| pending.bucket_store_for(bucket_id).examples.map { |example| example[:id] } }
+
+      expect(response_ids + pending_ids).to include("b.rb:1")
+    end
+  end
 end

@@ -12,6 +12,7 @@ module Specwrk
           retry_examples # pre-calculate before lock
 
           with_lock do
+            pending.reload
             processing.delete(*(completed_examples.keys + retry_examples.keys))
             pending.merge!(retry_examples)
           end

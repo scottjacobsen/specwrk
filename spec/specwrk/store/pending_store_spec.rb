@@ -238,6 +238,41 @@ RSpec.describe Specwrk::PendingStore do
         expect(instance.shift_bucket).to be_nil
       end
     end
+
+    context "prepend: true" do
+      before { stub_const("ENV", ENV.to_h.merge("SPECWRK_SRV_GROUP_BY" => "file")) }
+
+      # Reclaimed/requeued examples need to be handed back out before
+      # examples that have never run yet, so a straggler doesn't wait behind
+      # the entire remaining queue.
+      it "puts the new bucket ids before the existing ones" do
+        a_example = {"a.rb:1": {id: "a.rb:1", file_path: "a.rb"}}
+        b_example = {"b.rb:1": {id: "b.rb:1", file_path: "b.rb"}}
+
+        instance.merge!(a_example)
+        existing_bucket_id = instance.bucket_ids.first
+
+        instance.merge!(b_example, prepend: true)
+
+        new_bucket_id = (instance.reload.bucket_ids - [existing_bucket_id]).first
+
+        expect(instance.bucket_ids).to eq([new_bucket_id, existing_bucket_id])
+      end
+
+      it "still defaults to tail behavior when prepend is omitted" do
+        a_example = {"a.rb:1": {id: "a.rb:1", file_path: "a.rb"}}
+        b_example = {"b.rb:1": {id: "b.rb:1", file_path: "b.rb"}}
+
+        instance.merge!(a_example)
+        existing_bucket_id = instance.bucket_ids.first
+
+        instance.merge!(b_example)
+
+        new_bucket_id = (instance.reload.bucket_ids - [existing_bucket_id]).last
+
+        expect(instance.bucket_ids).to eq([existing_bucket_id, new_bucket_id])
+      end
+    end
   end
 
   describe "#shift_bucket" do
@@ -246,19 +281,35 @@ RSpec.describe Specwrk::PendingStore do
     end
   end
 
-  describe "#push_examples" do
-    it "adds a new bucket and returns its data later" do
-      instance.push_examples([{id: "a.rb:1", file_path: "a.rb"}])
+  describe "#reload" do
+    # The server's expiry-reclaim path reads bucket_ids, does other work while
+    # holding the store lock, then writes bucket_ids back — a stale in-memory
+    # read from before a concurrent writer's merge! would silently drop that
+    # writer's bucket id (the orphaned-bucket bug). Reloading before that
+    # read-modify-write must see the concurrent write instead of clobbering it.
+    it "sees bucket ids written by a separate instance and does not clobber them on the next write" do
+      a_example = {"a.rb:1": {id: "a.rb:1", file_path: "a.rb"}}
+      b_example = {"b.rb:1": {id: "b.rb:1", file_path: "b.rb"}}
 
-      bucket_id = instance.shift_bucket
-      expect(bucket_id).to be_a(String)
-      expect(bucket_for(bucket_id).examples).to eq([{id: "a.rb:1", file_path: "a.rb"}])
+      instance.merge!(a_example)
+      instance.bucket_ids # memoize state as of before the other instance's write
+
+      other_instance = described_class.new(uri_string, scope)
+      other_instance.merge!(b_example)
+
+      expect(instance.reload.bucket_ids.length).to eq(2)
+
+      shifted_id = instance.shift_bucket
+      expect(bucket_for(shifted_id).examples.map { |example| example[:id] }).to eq(["a.rb:1"])
+      expect(instance.reload.bucket_ids.length).to eq(1)
     end
   end
 
   describe "#clear" do
     it "removes stored buckets" do
-      instance.push_examples([{id: "a.rb:1", file_path: "a.rb"}])
+      a_example = {"a.rb:1": {id: "a.rb:1", file_path: "a.rb"}}
+
+      instance.merge!(a_example)
       bucket_id = instance.shift_bucket
       bucket = bucket_for(bucket_id)
 
@@ -273,7 +324,9 @@ RSpec.describe Specwrk::PendingStore do
 
   describe "#bucket_store_for / #delete_bucket" do
     it "returns a bucket store scoped to the pending store and can delete it" do
-      instance.push_examples([{id: "a.rb:1", file_path: "a.rb"}])
+      a_example = {"a.rb:1": {id: "a.rb:1", file_path: "a.rb"}}
+
+      instance.merge!(a_example)
       bucket_id = instance.shift_bucket
 
       bucket = instance.bucket_store_for(bucket_id)
