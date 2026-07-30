@@ -117,6 +117,20 @@ RSpec.describe Specwrk::Worker do
 
         expect(subject).to eq(42)
       end
+
+      it "clamps the failure count to 255 so it survives becoming a process exit status" do
+        # The return value is handed to exit!; POSIX keeps only the low 8 bits
+        # of an exit status, so a raw count of exactly 256 (or any multiple)
+        # would exit 0 and report a wholly-failing worker as green.
+        expect(instance).to receive(:execute)
+          .and_raise(Specwrk::CompletedAllExamplesError)
+
+        expect(client).to receive(:worker_status)
+          .at_least(:once)
+          .and_return(256)
+
+        expect(subject).to eq(255)
+      end
     end
 
     context "Specwrk.force_quit" do
@@ -418,6 +432,107 @@ RSpec.describe Specwrk::Worker do
 
       expect { instance.run_in_fork([{id: "a.rb:1", file_path: "a.rb"}]) }
         .to change { instance.metrics[:buckets] }.from(0).to(1)
+    end
+
+    # A child that finished its examples and wrote the results file can still
+    # blow the bucket timeout inside a before_fork_exit hook (a wedged exit
+    # flush). Those results are real — the tests themselves were fine — so the
+    # kill must salvage them instead of reporting every example as failed.
+    it "salvages fully-written results when the killed child hung after writing them" do
+      allow(instance).to receive(:bucket_timeout).and_return(1)
+      allow(executor).to receive(:run)
+      allow(executor).to receive(:examples)
+        .and_return([{id: "a.rb:1", status: "passed", run_time: 0.1}])
+      Specwrk.before_fork_exit { sleep 60 } # hang AFTER the results write
+
+      allow(instance).to receive(:log_ts) # the SIGQUIT dump line also logs
+      expect(instance).to receive(:log_ts).with(a_string_including("salvaged"))
+
+      results = instance.run_in_fork([{id: "a.rb:1", file_path: "a.rb"}])
+      expect(results).to eq([{id: "a.rb:1", status: "passed", run_time: 0.1}])
+    end
+
+    it "reports failures when the killed child never wrote results" do
+      allow(instance).to receive(:bucket_timeout).and_return(1)
+      allow(executor).to receive(:run) { sleep 60 } # hang BEFORE the results write
+      allow(executor).to receive(:unexecuted_failure)
+        .with({id: "a.rb:1", file_path: "a.rb"})
+        .and_return({id: "a.rb:1", status: "failed"})
+
+      allow(instance).to receive(:log_ts) # the SIGQUIT dump line also logs
+      expect(instance).to receive(:log_ts).with(a_string_including("reporting its examples as failures"))
+
+      results = instance.run_in_fork([{id: "a.rb:1", file_path: "a.rb"}])
+      expect(results).to eq([{id: "a.rb:1", status: "failed"}])
+    end
+
+    # The whole point of QUIT-before-KILL: a hung child killed outright destroys
+    # the evidence of WHERE it hung. The child traps SIGQUIT, dumps every
+    # thread's backtrace to stderr, and exits on its own — no SIGKILL needed
+    # when the main thread is interruptibly blocked (Ruby locks, IO waits).
+    it "collects a thread dump via SIGQUIT and skips SIGKILL when the child honors it" do
+      allow(instance).to receive(:bucket_timeout).and_return(1)
+      allow(executor).to receive(:run) { sleep 60 } # interruptibly hung
+      allow(executor).to receive(:unexecuted_failure)
+        .with({id: "a.rb:1", file_path: "a.rb"})
+        .and_return({id: "a.rb:1", status: "failed"})
+
+      allow(Process).to receive(:kill).and_call_original
+      allow(instance).to receive(:log_ts)
+
+      results = instance.run_in_fork([{id: "a.rb:1", file_path: "a.rb"}])
+
+      expect(Process).to have_received(:kill).with("QUIT", kind_of(Integer))
+      expect(Process).not_to have_received(:kill).with("KILL", anything)
+      expect(results).to eq([{id: "a.rb:1", status: "failed"}])
+    end
+
+    # A child stuck in an uninterruptible native call never runs the trap; the
+    # parent must still SIGKILL it after the grace period. Simulated by the
+    # child re-trapping QUIT to a no-op.
+    it "falls back to SIGKILL when the child ignores SIGQUIT" do
+      allow(instance).to receive(:bucket_timeout).and_return(1)
+      allow(instance).to receive(:quit_grace).and_return(1)
+      allow(executor).to receive(:run) do
+        Signal.trap("QUIT") {} # simulate an uninterruptible hang
+        sleep 60
+      end
+      allow(executor).to receive(:unexecuted_failure)
+        .with({id: "a.rb:1", file_path: "a.rb"})
+        .and_return({id: "a.rb:1", status: "failed"})
+
+      allow(Process).to receive(:kill).and_call_original
+      allow(instance).to receive(:log_ts)
+
+      results = instance.run_in_fork([{id: "a.rb:1", file_path: "a.rb"}])
+
+      expect(Process).to have_received(:kill).with("QUIT", kind_of(Integer))
+      expect(Process).to have_received(:kill).with("KILL", kind_of(Integer))
+      expect(results).to eq([{id: "a.rb:1", status: "failed"}])
+    end
+  end
+
+  describe "#salvage_bucket_results" do
+    let(:examples) { [{id: "a.rb:1", file_path: "a.rb"}, {id: "b.rb:2", file_path: "b.rb"}] }
+
+    it "returns nil for an empty results file" do
+      expect(instance.salvage_bucket_results(examples, "")).to be_nil
+    end
+
+    it "returns nil for truncated JSON (killed mid-write)" do
+      data = JSON.generate([{id: "a.rb:1", status: "passed"}])[0..-5]
+
+      expect(instance.salvage_bucket_results(examples, data)).to be_nil
+    end
+
+    it "fills in synthesized failures for assigned examples missing from the results" do
+      allow(executor).to receive(:unexecuted_failure)
+        .with(examples.last)
+        .and_return({id: "b.rb:2", status: "failed"})
+      data = JSON.generate([{id: "a.rb:1", status: "passed"}])
+
+      expect(instance.salvage_bucket_results(examples, data))
+        .to eq([{id: "a.rb:1", status: "passed"}, {id: "b.rb:2", status: "failed"}])
     end
   end
 

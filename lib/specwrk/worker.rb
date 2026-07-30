@@ -186,6 +186,7 @@ module Specwrk
       results_file.close
 
       pid = fork do
+        install_quit_backtrace_trap
         Specwrk.after_fork!
         executor.run(examples)
         executor.flush_log
@@ -199,12 +200,33 @@ module Specwrk
 
       wait_status = wait_for_child(pid)
       if wait_status.nil?
-        # The child blew past the bucket timeout — almost certainly a hung example
-        # (e.g. a wedged browser in a system spec). Kill it and report the bucket
-        # as failures rather than letting one hung test stall the whole node in an
-        # unbounded Process.wait2 until CI's no-output timeout kills the container.
-        Process.kill("KILL", pid)
-        Process.wait(pid)
+        # The child blew past the bucket timeout — usually a hung example (e.g. a
+        # wedged browser in a system spec), but sometimes a hang in the
+        # before_fork_exit flush AFTER the tests finished and the results file
+        # was fully written. Kill it rather than letting one hung process stall
+        # the whole node in an unbounded Process.wait2 until CI's no-output
+        # timeout kills the container — but salvage the results file if it is
+        # complete: those examples really ran, and reporting them all as failed
+        # would fail the node over an exit-hook hang unrelated to the tests.
+        #
+        # SIGQUIT goes first: killing outright destroys the evidence of WHERE
+        # the child hung. Its trap (install_quit_backtrace_trap) dumps every
+        # thread's backtrace to stderr and exits; SIGKILL only follows when the
+        # child is too far gone to run the trap (blocked in native code) — and
+        # that silence is itself diagnostic.
+        log_ts "bucket exceeded #{bucket_timeout}s — sending SIGQUIT to child #{pid} for a thread dump"
+        signal_child("QUIT", pid)
+        unless wait_for_child(pid, timeout: quit_grace)
+          signal_child("KILL", pid)
+          Process.wait(pid)
+        end
+
+        salvaged = salvage_bucket_results(examples, File.read(results_file.path))
+        if salvaged
+          log_ts "bucket exceeded #{bucket_timeout}s — killed child #{pid}, salvaged its written results"
+          return salvaged
+        end
+
         log_ts "bucket exceeded #{bucket_timeout}s — killed child #{pid}, reporting its examples as failures"
         return examples.map { |example| executor.unexecuted_failure(example) }
       end
@@ -221,16 +243,54 @@ module Specwrk
       @metrics[:bucket_wall] += Process.clock_gettime(Process::CLOCK_MONOTONIC) - bucket_started_at
     end
 
-    # Reap the child, but give up after bucket_timeout so a hung example can't
+    # Installed as the first thing in every per-bucket child. When the parent
+    # decides the bucket is hung it sends SIGQUIT before SIGKILL; this trap
+    # writes every thread's backtrace to stderr (the node's job output) and
+    # exits, so a wedged child leaves the exact blocked frames behind instead
+    # of vanishing. Trap context forbids Mutex use, so only plain IO writes
+    # here. If the main thread is blocked in an uninterruptible native call
+    # the trap never runs and the parent's SIGKILL follows — the absence of a
+    # dump distinguishes a native-level block from a Ruby-level one.
+    def install_quit_backtrace_trap
+      Signal.trap("QUIT") do
+        $stderr.write "\nspecwrk child #{Process.pid}: SIGQUIT thread dump\n"
+        Thread.list.each do |thread|
+          $stderr.write "--- #{thread.inspect} status=#{thread.status.inspect}\n"
+          $stderr.write((thread.backtrace || ["<no backtrace>"]).join("\n"))
+          $stderr.write "\n"
+        end
+        Process.exit!(2)
+      end
+    end
+
+    # Reap the child, but give up after the timeout so a hung example can't
     # stall the node. Returns the Process::Status on exit, or nil on timeout.
-    def wait_for_child(pid)
-      deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + bucket_timeout
+    def wait_for_child(pid, timeout: bucket_timeout)
+      deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + timeout
       loop do
         _, status = Process.wait2(pid, Process::WNOHANG)
         return status if status
         return nil if Process.clock_gettime(Process::CLOCK_MONOTONIC) > deadline
         sleep 0.5
       end
+    end
+
+    # Results from a killed child, if it got as far as writing them. nil unless
+    # the file holds complete, parseable JSON (File.write is a single call, so a
+    # kill mid-write leaves truncated JSON, which fails to parse). Any assigned
+    # example missing from a parsed file is synthesized as a failure so the
+    # server always gets a result for everything it handed out.
+    def salvage_bucket_results(examples, data)
+      return if data.empty?
+
+      results = JSON.parse(data, symbolize_names: true)
+      results_by_id = results.group_by { |result| result[:id] if result.is_a?(Hash) }
+
+      examples.flat_map do |example|
+        results_by_id[example[:id]] || executor.unexecuted_failure(example)
+      end
+    rescue JSON::ParserError
+      nil
     end
 
     def decode_bucket_results(examples, success, data)
@@ -271,6 +331,20 @@ module Specwrk
 
     def final_output
       $final_output || $stdout # standard:disable Style/GlobalVars
+    end
+
+    # The child may die between the timeout decision and the signal; that's a
+    # win, not an error (Process.wait still reaps it).
+    def signal_child(signal, pid)
+      Process.kill(signal, pid)
+    rescue Errno::ESRCH
+      nil
+    end
+
+    # Seconds the parent waits for a SIGQUITed child to dump its threads and
+    # exit before escalating to SIGKILL.
+    def quit_grace
+      @quit_grace ||= ENV.fetch("SPECWRK_QUIT_GRACE", "5").to_f
     end
 
     # How many empty /pop checks (0.5s apart) to tolerate before a worker gives up
@@ -396,7 +470,11 @@ module Specwrk
       return 0 if @all_examples_completed && client.worker_status.zero?
       return 1 if Specwrk.force_quit
 
-      client.worker_status
+      # This becomes the process exit status (the init script exit!s with it),
+      # and POSIX keeps only the low 8 bits — a raw failure count of exactly 256
+      # (or any multiple) would truncate to 0 and report a failing worker as
+      # green. Clamp; counts under 255 still come through exactly.
+      client.worker_status.clamp(0, 255)
     end
 
     def warn(msg)
