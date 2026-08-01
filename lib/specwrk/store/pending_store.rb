@@ -136,6 +136,11 @@ module Specwrk
     # per-file round trips to the server and dispatches the slowest files first to
     # avoid stragglers. Files without timing data sort first (treated as longest)
     # and get their own bucket.
+    #
+    # With SPECWRK_SRV_SPLIT_FILES=1, a file whose total run time exceeds the
+    # bucket target is first carved into example-level chunks that each fit the
+    # target (see split_oversized_file), so one chunky file can no longer pin a
+    # worker for a multiple of the target. Each chunk then packs like a file.
     def group_by_batched_file(examples)
       # A run time of 0 is synthesized (e.g. an example reported as unexecuted),
       # not measured, so treat it like a missing timing. Otherwise zero-timed
@@ -158,7 +163,10 @@ module Specwrk
       # thousands of examples into one unsplittable pseudo-file mega-bucket.
       file_groups = examples.group_by { |example| Specwrk.example_file_key(example) }
         .values
-        .sort_by { |file_examples| -file_run_time.call(file_examples) }
+
+      file_groups = file_groups.flat_map { |file_examples| split_oversized_file(file_examples, file_run_time) } if split_files?
+
+      file_groups = file_groups.sort_by { |file_examples| -file_run_time.call(file_examples) }
 
       buckets = []
       current_bucket = []
@@ -179,6 +187,42 @@ module Specwrk
 
       buckets << current_bucket if current_bucket.any?
       buckets
+    end
+
+    # Carve one oversized file's examples into chunks that each fit the bucket
+    # run-time target. Each chunk becomes its own file load in whatever bucket
+    # it lands in, so every chunk is charged file_overhead. Only a file whose
+    # total is measured (finite) is split: with any unknown-timing example the
+    # total is unknowable, so the file keeps the whole-file unknown handling
+    # (its own bucket, dispatched first). A single example longer than the
+    # target gets a chunk to itself — that's the floor of what splitting can do.
+    def split_oversized_file(file_examples, file_run_time)
+      return [file_examples] unless file_run_time.call(file_examples).finite?
+      return [file_examples] unless file_run_time.call(file_examples) > bucket_run_time_target
+
+      chunks = []
+      current_chunk = []
+      current_total = file_overhead
+
+      file_examples.each do |example|
+        run_time = example[:expected_run_time]
+
+        if current_chunk.any? && (current_total + run_time) > bucket_run_time_target
+          chunks << current_chunk
+          current_chunk = []
+          current_total = file_overhead
+        end
+
+        current_chunk << example
+        current_total += run_time
+      end
+
+      chunks << current_chunk if current_chunk.any?
+      chunks
+    end
+
+    def split_files?
+      ENV["SPECWRK_SRV_SPLIT_FILES"] == "1"
     end
 
     # Take elements until the average runtime bucket has filled

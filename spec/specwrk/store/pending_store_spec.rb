@@ -239,6 +239,126 @@ RSpec.describe Specwrk::PendingStore do
       end
     end
 
+    context "splitting oversized files (SPECWRK_SRV_SPLIT_FILES)" do
+      before do
+        stub_const("ENV", ENV.to_h.merge(
+          "SPECWRK_SRV_GROUP_BY" => "file",
+          "SPECWRK_SRV_BUCKET_RUN_TIME" => "2.5",
+          "SPECWRK_SRV_SPLIT_FILES" => "1"
+        ))
+      end
+
+      it "splits a file whose run time exceeds the target into example chunks that each fit" do
+        # One chunky 6.0s file: without splitting it is a single 6.0s bucket
+        # (2.4x the target) that pins its worker; with splitting its examples
+        # pack greedily into 2.0s chunks under the 2.5s target.
+        instance.merge!((1..6).to_h { |n|
+          [:"big.rb:#{n}", {id: "big.rb:#{n}", expected_run_time: 1.0, file_path: "big.rb"}]
+        })
+
+        buckets = []
+        while (bucket_id = instance.shift_bucket)
+          buckets << bucket_for(bucket_id).examples.map { |example| example[:id] }
+        end
+
+        expect(buckets.length).to eq(3)
+        expect(buckets.flatten).to match_array((1..6).map { |n| "big.rb:#{n}" })
+        expect(buckets.map(&:length)).to all(eq(2))
+      end
+
+      it "keeps files under the target whole and packs them alongside the chunks" do
+        instance.merge!({
+          "big.rb:1": {id: "big.rb:1", expected_run_time: 2.0, file_path: "big.rb"},
+          "big.rb:2": {id: "big.rb:2", expected_run_time: 2.0, file_path: "big.rb"},
+          "small.rb:1": {id: "small.rb:1", expected_run_time: 0.2, file_path: "small.rb"},
+          "small.rb:2": {id: "small.rb:2", expected_run_time: 0.2, file_path: "small.rb"}
+        })
+
+        buckets = []
+        while (bucket_id = instance.shift_bucket)
+          buckets << bucket_for(bucket_id).examples
+        end
+
+        # big.rb (4.0s) splits into two 2.0s chunks; small.rb (0.4s) stays
+        # whole. The small file shares a bucket with a 2.0s chunk (2.4s <=
+        # the 2.5s target), so we get 2 buckets, not 3.
+        expect(buckets.length).to eq(2)
+        small_bucket = buckets.find { |examples| examples.any? { |example| example[:id].start_with?("small") } }
+        expect(small_bucket.map { |example| example[:id] }).to contain_exactly("small.rb:1", "small.rb:2", a_string_starting_with("big.rb"))
+      end
+
+      it "charges the per-file overhead once per chunk" do
+        stub_const("ENV", ENV.to_h.merge(
+          "SPECWRK_SRV_GROUP_BY" => "file",
+          "SPECWRK_SRV_BUCKET_RUN_TIME" => "2.5",
+          "SPECWRK_SRV_SPLIT_FILES" => "1",
+          "SPECWRK_SRV_FILE_OVERHEAD" => "1.0"
+        ))
+
+        # Each example is 1.0s; with 1.0s overhead a chunk fits only one
+        # example (1.0 + 1.0 = 2.0; adding a second would make 3.0 > 2.5).
+        instance.merge!({
+          "big.rb:1": {id: "big.rb:1", expected_run_time: 1.0, file_path: "big.rb"},
+          "big.rb:2": {id: "big.rb:2", expected_run_time: 1.0, file_path: "big.rb"},
+          "big.rb:3": {id: "big.rb:3", expected_run_time: 1.0, file_path: "big.rb"}
+        })
+
+        buckets = []
+        while (bucket_id = instance.shift_bucket)
+          buckets << bucket_for(bucket_id).examples.length
+        end
+
+        expect(buckets).to eq([1, 1, 1])
+      end
+
+      it "does not split a file containing an unknown-timing example" do
+        # A nil/0 run time makes the file's total unknowable — it keeps the
+        # whole-file unknown handling (own bucket, dispatched first).
+        instance.merge!({
+          "mixed.rb:1": {id: "mixed.rb:1", expected_run_time: 3.0, file_path: "mixed.rb"},
+          "mixed.rb:2": {id: "mixed.rb:2", expected_run_time: nil, file_path: "mixed.rb"},
+          "a.rb:1": {id: "a.rb:1", expected_run_time: 1.0, file_path: "a.rb"}
+        })
+
+        first_bucket_id = instance.shift_bucket
+        second_bucket_id = instance.shift_bucket
+
+        expect(bucket_for(first_bucket_id).examples.map { |example| example[:id] }).to contain_exactly("mixed.rb:1", "mixed.rb:2")
+        expect(bucket_for(second_bucket_id).examples.map { |example| example[:id] }).to eq(["a.rb:1"])
+        expect(instance.shift_bucket).to be_nil
+      end
+
+      it "gives a single example longer than the target its own chunk" do
+        instance.merge!({
+          "big.rb:1": {id: "big.rb:1", expected_run_time: 4.0, file_path: "big.rb"},
+          "big.rb:2": {id: "big.rb:2", expected_run_time: 1.0, file_path: "big.rb"}
+        })
+
+        buckets = []
+        while (bucket_id = instance.shift_bucket)
+          buckets << bucket_for(bucket_id).examples.map { |example| example[:id] }
+        end
+
+        expect(buckets).to eq([["big.rb:1"], ["big.rb:2"]])
+      end
+
+      it "leaves oversized files whole when SPECWRK_SRV_SPLIT_FILES is not set" do
+        # ENV is already stubbed by the context before block, so the flag must
+        # be explicitly removed, not just omitted from the merge.
+        stub_const("ENV", ENV.to_h.except("SPECWRK_SRV_SPLIT_FILES"))
+
+        instance.merge!({
+          "big.rb:1": {id: "big.rb:1", expected_run_time: 3.0, file_path: "big.rb"},
+          "big.rb:2": {id: "big.rb:2", expected_run_time: 3.0, file_path: "big.rb"}
+        })
+
+        bucket_id = instance.shift_bucket
+
+        expect(bucket_for(bucket_id).examples.map { |example| example[:id] }).to eq(["big.rb:1", "big.rb:2"])
+        expect(instance.shift_bucket).to be_nil
+      end
+    end
+
     context "prepend: true" do
       before { stub_const("ENV", ENV.to_h.merge("SPECWRK_SRV_GROUP_BY" => "file")) }
 
