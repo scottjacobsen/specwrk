@@ -1,0 +1,14 @@
+# frozen_string_literal: true
+
+source "https://rubygems.org"
+
+# Gemfile for the Puma-based queue-server image (docker/Dockerfile.puma-server).
+# Kept separate from the gem's own Gemfile so the server runtime deps don't
+# leak into the development/test environment.
+gem "specwrk", path: ".."
+
+gem "puma"
+# Fork with the blocking (BRPOPLPUSH token handoff) per-run lock -- the
+# released gem still spin-polls LINDEX, which is the contention ceiling.
+gem "specwrk-store-redis_adapter", github: "scottjacobsen/specwrk-store-redis_adapter", branch: "main"
+gem "msgpack" # optional payload serializer (SPECWRK_STORE_SERIALIZER=msgpack)

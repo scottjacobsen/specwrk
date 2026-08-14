@@ -1,0 +1,50 @@
+# syntax=docker/dockerfile:1
+# Queue-server image built from this checkout (not the released gem), running
+# under a Puma cluster with the Redis store adapter -- a configuration
+# validated against a ~100k-example production suite. See
+# docker/Dockerfile.server for the upstream pitchfork/thruster variant.
+#
+# Build from the repo root:
+#   docker buildx build --platform linux/amd64 -f docker/Dockerfile.puma-server -t specwrk-server .
+
+FROM ruby:4.0-slim AS build
+
+# git: the gemspec lists files via `git ls-files`; the binary must exist even
+# though /app is not a git repo (the popen degrades to an empty list, which is
+# fine for a path-sourced gem).
+# libssl-dev: without it puma's extension compiles silently without SSL and
+# ssl:// binds fail at boot.
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends build-essential git libssl-dev && \
+    rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+ENV BUNDLE_GEMFILE=/app/docker/Gemfile.puma-server \
+    BUNDLE_FROZEN=1
+
+COPY . .
+RUN bundle install --jobs 4
+
+FROM ruby:4.0-slim
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends git curl && \
+    rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+ENV BUNDLE_GEMFILE=/app/docker/Gemfile.puma-server
+
+COPY --from=build /usr/local/bundle /usr/local/bundle
+COPY . .
+
+# .specwrk is only used by the default file store; the server runs against
+# Redis in practice, but keep the fallback writable.
+RUN useradd --system --create-home specwrk && \
+    mkdir -p .specwrk && \
+    chown specwrk:specwrk .specwrk
+USER specwrk
+
+ENV PORT=5138
+EXPOSE 5138
+
+ENTRYPOINT ["docker/entrypoint.puma-server.sh"]

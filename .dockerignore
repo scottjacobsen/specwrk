@@ -1,0 +1,9 @@
+.git
+.jj
+.specwrk
+.github
+spec
+tmp
+log
+*.gem
+*.log
