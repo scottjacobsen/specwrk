@@ -23,7 +23,7 @@ RSpec.describe Specwrk::Web::Endpoints::Seed do
       bucket_id = pending.shift_bucket
       expect(bucket_id).to be_a(String)
       expect(original_bucket_ids).not_to include(bucket_id)
-      expect(Specwrk::BucketStore.new(datastore_uri, File.join("pending", "buckets", bucket_id)).examples.map { |ex| ex[:id] }).to eq(["a.rb:1"])
+      expect(Specwrk::BucketStore.new(datastore_uri, run_scope("pending", "buckets", bucket_id)).examples.map { |ex| ex[:id] }).to eq(["a.rb:1"])
     end
     it { expect { subject }.to change { pending.reload.max_retries }.from(0).to(42) }
   end
@@ -43,8 +43,8 @@ RSpec.describe Specwrk::Web::Endpoints::Seed do
       first_bucket_id = pending.shift_bucket
       second_bucket_id = pending.shift_bucket
 
-      expect(Specwrk::BucketStore.new(datastore_uri, File.join("pending", "buckets", first_bucket_id)).examples.map { |ex| ex[:id] }).to eq(%w[a.rb:1 a.rb:2])
-      expect(Specwrk::BucketStore.new(datastore_uri, File.join("pending", "buckets", second_bucket_id)).examples.map { |ex| ex[:id] }).to eq(%w[b.rb:1])
+      expect(Specwrk::BucketStore.new(datastore_uri, run_scope("pending", "buckets", first_bucket_id)).examples.map { |ex| ex[:id] }).to eq(%w[a.rb:1 a.rb:2])
+      expect(Specwrk::BucketStore.new(datastore_uri, run_scope("pending", "buckets", second_bucket_id)).examples.map { |ex| ex[:id] }).to eq(%w[b.rb:1])
       expect(pending.shift_bucket).to be_nil
     end
   end
@@ -68,8 +68,8 @@ RSpec.describe Specwrk::Web::Endpoints::Seed do
       first_bucket_id = pending.shift_bucket
       second_bucket_id = pending.shift_bucket
 
-      expect(Specwrk::BucketStore.new(datastore_uri, File.join("pending", "buckets", first_bucket_id)).examples.map { |ex| ex[:id] }).to eq(%w[a_spec.rb:1 a_spec.rb:2])
-      expect(Specwrk::BucketStore.new(datastore_uri, File.join("pending", "buckets", second_bucket_id)).examples.map { |ex| ex[:id] }).to eq(%w[b_spec.rb:1])
+      expect(Specwrk::BucketStore.new(datastore_uri, run_scope("pending", "buckets", first_bucket_id)).examples.map { |ex| ex[:id] }).to eq(%w[a_spec.rb:1 a_spec.rb:2])
+      expect(Specwrk::BucketStore.new(datastore_uri, run_scope("pending", "buckets", second_bucket_id)).examples.map { |ex| ex[:id] }).to eq(%w[b_spec.rb:1])
       expect(pending.shift_bucket).to be_nil
     end
   end
@@ -101,9 +101,9 @@ RSpec.describe Specwrk::Web::Endpoints::Seed do
       second_bucket_id = pending.shift_bucket
       third_bucket_id = pending.shift_bucket
 
-      expect(Specwrk::BucketStore.new(datastore_uri, File.join("pending", "buckets", first_bucket_id)).examples.map { |ex| ex[:id] }).to eq(%w[b.rb:3])
-      expect(Specwrk::BucketStore.new(datastore_uri, File.join("pending", "buckets", second_bucket_id)).examples.map { |ex| ex[:id] }).to eq(%w[b.rb:4])
-      expect(Specwrk::BucketStore.new(datastore_uri, File.join("pending", "buckets", third_bucket_id)).examples.map { |ex| ex[:id] }).to eq(%w[a.rb:2 a.rb:1])
+      expect(Specwrk::BucketStore.new(datastore_uri, run_scope("pending", "buckets", first_bucket_id)).examples.map { |ex| ex[:id] }).to eq(%w[b.rb:3])
+      expect(Specwrk::BucketStore.new(datastore_uri, run_scope("pending", "buckets", second_bucket_id)).examples.map { |ex| ex[:id] }).to eq(%w[b.rb:4])
+      expect(Specwrk::BucketStore.new(datastore_uri, run_scope("pending", "buckets", third_bucket_id)).examples.map { |ex| ex[:id] }).to eq(%w[a.rb:2 a.rb:1])
       expect(pending.shift_bucket).to be_nil
     end
   end

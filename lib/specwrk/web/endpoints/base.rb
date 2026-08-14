@@ -69,23 +69,23 @@ module Specwrk
         end
 
         def pending
-          @pending ||= PendingStore.new(ENV.fetch("SPECWRK_SRV_STORE_URI", "memory:///"), File.join(run_id, "pending"))
+          @pending ||= PendingStore.new(ENV.fetch("SPECWRK_SRV_STORE_URI", "memory:///"), File.join(run_scope, "pending"))
         end
 
         def processing
-          @processing ||= ProcessingStore.new(ENV.fetch("SPECWRK_SRV_STORE_URI", "memory:///"), File.join(run_id, "processing"))
+          @processing ||= ProcessingStore.new(ENV.fetch("SPECWRK_SRV_STORE_URI", "memory:///"), File.join(run_scope, "processing"))
         end
 
         def completed
-          @completed ||= CompletedStore.new(ENV.fetch("SPECWRK_SRV_STORE_URI", "memory:///"), File.join(run_id, "completed"))
+          @completed ||= CompletedStore.new(ENV.fetch("SPECWRK_SRV_STORE_URI", "memory:///"), File.join(run_scope, "completed"))
         end
 
         def failure_counts
-          @failure_counts ||= Store.new(ENV.fetch("SPECWRK_SRV_STORE_URI", "memory:///"), File.join(run_id, "failure_counts"))
+          @failure_counts ||= Store.new(ENV.fetch("SPECWRK_SRV_STORE_URI", "memory:///"), File.join(run_scope, "failure_counts"))
         end
 
         def metadata
-          @metadata ||= Store.new(ENV.fetch("SPECWRK_SRV_STORE_URI", "memory:///"), File.join(run_id, "metadata"))
+          @metadata ||= Store.new(ENV.fetch("SPECWRK_SRV_STORE_URI", "memory:///"), File.join(run_scope, "metadata"))
         end
 
         def run_times
@@ -107,18 +107,27 @@ module Specwrk
         end
 
         def worker_store_for(id)
-          WorkerStore.new(ENV.fetch("SPECWRK_SRV_STORE_URI", "memory:///"), File.join(run_id, "workers", id))
+          WorkerStore.new(ENV.fetch("SPECWRK_SRV_STORE_URI", "memory:///"), File.join(run_scope, "workers", id))
         end
 
         def run_id
           request.get_header("HTTP_X_SPECWRK_RUN")
         end
 
+        # The braces are a Redis Cluster hash tag: every key for a run — its
+        # stores and its lock — hashes to the same cluster slot, which
+        # multi-key and pipelined operations on the run require. The global
+        # run_times store stays untagged; it's shared across runs. Other
+        # adapters treat the braces as ordinary characters.
+        def run_scope
+          @run_scope ||= "{#{run_id}}"
+        end
+
         def with_lock
           return yield unless run_id
 
           with_mutex do
-            Store.with_lock(URI(ENV.fetch("SPECWRK_SRV_STORE_URI", "memory:///")), run_id) { yield }
+            Store.with_lock(URI(ENV.fetch("SPECWRK_SRV_STORE_URI", "memory:///")), run_scope) { yield }
           end
         end
 

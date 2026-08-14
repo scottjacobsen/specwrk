@@ -31,14 +31,20 @@ end
 RSpec.shared_context "worker endpoint" do
   include_context "endpoint"
 
-  let(:metadata) { Specwrk::Store.new datastore_uri, "metadata" }
+  # Mirrors the server's key layout: run-scoped stores live under the
+  # hash-tagged run id ("{main}/pending"), so observer stores must too.
+  def run_scope(*parts)
+    File.join("{#{run_id}}", *parts)
+  end
+
+  let(:metadata) { Specwrk::Store.new datastore_uri, run_scope("metadata") }
   let(:run_times) { Specwrk::Store.new base_uri, "run_times" }
-  let(:pending) { Specwrk::PendingStore.new datastore_uri, "pending" }
-  let(:processing) { Specwrk::Store.new datastore_uri, "processing" }
-  let(:completed) { Specwrk::CompletedStore.new datastore_uri, "completed" }
-  let(:worker) { Specwrk::WorkerStore.new datastore_uri, File.join("workers", worker_id.to_s) }
-  let(:other_worker) { Specwrk::WorkerStore.new datastore_uri, File.join("workers", other_worker_id.to_s) }
-  let(:failure_counts) { Specwrk::Store.new datastore_uri, "failure_counts" }
+  let(:pending) { Specwrk::PendingStore.new datastore_uri, run_scope("pending") }
+  let(:processing) { Specwrk::Store.new datastore_uri, run_scope("processing") }
+  let(:completed) { Specwrk::CompletedStore.new datastore_uri, run_scope("completed") }
+  let(:worker) { Specwrk::WorkerStore.new datastore_uri, run_scope("workers", worker_id.to_s) }
+  let(:other_worker) { Specwrk::WorkerStore.new datastore_uri, run_scope("workers", other_worker_id.to_s) }
+  let(:failure_counts) { Specwrk::Store.new datastore_uri, run_scope("failure_counts") }
 
   let(:existing_run_times_data) { {} }
   let(:existing_pending_data) { {} }
@@ -50,8 +56,7 @@ RSpec.shared_context "worker endpoint" do
   let(:run_id) { "main" }
   let(:worker_id) { "foobar-0" }
   let(:other_worker_id) { "foobar-1" }
-  let(:datastore_uri) { "file://#{datastore_path}" }
-  let(:datastore_path) { File.join(base_path, run_id) }
+  let(:datastore_uri) { base_uri }
   let(:base_uri) { "file://#{base_path}" }
   let(:base_path) { File.join(Dir.tmpdir, SecureRandom.uuid) }
   let(:env_vars) { {"SPECWRK_OUT" => base_path, "SPECWRK_SRV_STORE_URI" => base_uri} }
