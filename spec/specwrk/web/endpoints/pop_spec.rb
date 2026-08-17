@@ -20,6 +20,33 @@ RSpec.describe Specwrk::Web::Endpoints::Pop do
     it { is_expected.to eq([204, {"content-type" => "text/plain", "x-specwrk-status" => "1"}, ["Waiting for sample to be seeded."]]) }
   end
 
+  context "workers index bookkeeping" do
+    let(:workers_index) { Specwrk::Store.new(datastore_uri, run_scope("workers_index")) }
+
+    context "on a pop" do
+      let(:existing_pending_data) do
+        {"a.rb:2": {id: "a.rb:2", file_path: "a.rb", expected_run_time: 0.1}}
+      end
+
+      it "records the worker's contact" do
+        expect { subject }.to change { workers_index.reload[worker_id] }.from(nil).to(be_within(5).of(Time.now.to_i))
+      end
+    end
+
+    context "on the gone-home 410" do
+      let(:existing_completed_data) do
+        {"a.rb:2": {id: "a.rb:2", file_path: "a.rb", expected_run_time: 0.1}}
+      end
+
+      before { workers_index[worker_id] = Time.now.to_i }
+
+      it "removes the worker so it can't linger as stale in /metrics" do
+        expect(response[0]).to eq(410)
+        expect(workers_index.reload[worker_id]).to be_nil
+      end
+    end
+  end
+
   context "no items in the processing queue, no known failed for worker, but completed queue has items" do
     let(:existing_completed_data) do
       {"a.rb:2": {id: "a.rb:2", file_path: "a.rb", expected_run_time: 0.1}}

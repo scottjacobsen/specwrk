@@ -46,6 +46,29 @@ RSpec.describe Specwrk::PendingStore do
     it { is_expected.to eq(4) }
   end
 
+  describe "#example_count" do
+    subject { instance.example_count }
+
+    context "no buckets" do
+      it { is_expected.to eq(0) }
+    end
+
+    context "examples queued across buckets" do
+      before do
+        stub_const("ENV", ENV.to_h.merge("SPECWRK_SRV_GROUP_BY" => "file"))
+
+        instance.merge!({
+          "a.rb:1": {id: "a.rb:1", file_path: "a.rb"},
+          "a.rb:2": {id: "a.rb:2", file_path: "a.rb"},
+          "b.rb:1": {id: "b.rb:1", file_path: "b.rb"}
+        })
+      end
+
+      it { is_expected.to eq(3) }
+      it { expect { instance.shift_bucket }.to change(instance, :example_count).from(3).to(1) }
+    end
+  end
+
   describe "#merge!" do
     context "grouping by timings" do
       before do

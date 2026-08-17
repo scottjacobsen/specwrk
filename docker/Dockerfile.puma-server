@@ -45,6 +45,8 @@ RUN useradd --system --create-home specwrk && \
 USER specwrk
 
 ENV PORT=5138
-EXPOSE 5138
+# 9394 is the plain-HTTP Prometheus metrics listener (see docker/puma.rb);
+# expose it to scrapers on the internal network only, never publicly.
+EXPOSE 5138 9394
 
 ENTRYPOINT ["docker/entrypoint.puma-server.sh"]

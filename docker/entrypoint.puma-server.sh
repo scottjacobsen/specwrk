@@ -15,4 +15,6 @@ else
   bind="tcp://0.0.0.0:${PORT}"
 fi
 
-exec bundle exec puma -w "$PUMA_WORKERS" -t "${PUMA_THREADS}:${PUMA_THREADS}" -b "$bind" config.ru
+# docker/puma.rb only wires the Prometheus metrics listener (METRICS_PORT,
+# default 9394, 0/empty disables); CLI flags below take precedence over it.
+exec bundle exec puma -C docker/puma.rb -w "$PUMA_WORKERS" -t "${PUMA_THREADS}:${PUMA_THREADS}" -b "$bind" config.ru

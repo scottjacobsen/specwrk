@@ -17,6 +17,7 @@ require "specwrk/web"
 require "specwrk/web/logger"
 require "specwrk/web/auth"
 require "specwrk/web/endpoints/health"
+require "specwrk/web/endpoints/metrics"
 require "specwrk/web/endpoints/heartbeat"
 require "specwrk/web/endpoints/seed"
 require "specwrk/web/endpoints/pop"
@@ -72,7 +73,9 @@ module Specwrk
               use Specwrk::Web::Logger, $stdout, %w[/health]
             end
 
-            use Specwrk::Web::Auth, %w[/health] # global auth check
+            # Global auth check. /metrics is exempt like /health: scrapers
+            # don't carry the CI key, and the endpoint exposes only counts.
+            use Specwrk::Web::Auth, %w[/health /metrics]
             run Specwrk::Web::App.new           # your router
           end
         end
@@ -90,6 +93,8 @@ module Specwrk
         case [method, path]
         when ["GET", "/health"], ["HEAD", "/health"]
           Endpoints::Health
+        when ["GET", "/metrics"], ["HEAD", "/metrics"]
+          Endpoints::Metrics
         when ["GET", "/heartbeat"]
           Endpoints::Heartbeat
         when ["POST", "/pop"]

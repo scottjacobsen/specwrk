@@ -42,6 +42,12 @@ module Specwrk
       @bucket_ids ||= self[BUCKET_IDS_KEY] || []
     end
 
+    # Total examples still queued, summed from each bucket's stored count —
+    # one small read per bucket, never the example payloads themselves.
+    def example_count
+      bucket_ids.sum { |bucket_id| bucket_store_for(bucket_id).example_count }
+    end
+
     def merge!(hash, prepend: false)
       return self if hash.nil? || hash.empty?
 

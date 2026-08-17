@@ -92,6 +92,33 @@ module Specwrk
           @run_times ||= Store.new(ENV.fetch("SPECWRK_SRV_STORE_URI", "file://#{File.join(Dir.tmpdir, "specwrk")}"), "run_times")
         end
 
+        # Global run_id -> seeded-at-epoch index, written by /seed and read
+        # (and pruned) by /metrics. The Store abstraction deliberately has no
+        # keyspace scan, so an index is the only way to enumerate runs — and
+        # it stays portable across the memory/file/redis adapters. Untagged
+        # (no hash-tag braces) like run_times: it spans runs.
+        def runs_index
+          @runs_index ||= Store.new(ENV.fetch("SPECWRK_SRV_STORE_URI", "memory:///"), "runs_index")
+        end
+
+        # Per-run worker_id -> last-contact-epoch index so /metrics can
+        # enumerate a run's workers without a keyspace scan. Worker stores
+        # themselves are keyed {run}/workers/<id> and thus unenumerable.
+        def workers_index
+          @workers_index ||= Store.new(ENV.fetch("SPECWRK_SRV_STORE_URI", "memory:///"), File.join(run_scope, "workers_index"))
+        end
+
+        # Called from the worker-driven endpoints only — /heartbeat for idle
+        # workers, /pop and /complete_and_pop for busy ones (a busy worker's
+        # heartbeat thread stays quiet while its data client is active). The
+        # orchestrator's requests (/seed, /report, /shutdown) never land here,
+        # so the index holds exactly the worker fleet.
+        def record_worker_contact!
+          return if worker_id.empty?
+
+          workers_index[worker_id] = Time.now.to_i
+        end
+
         def worker
           @worker ||= worker_store_for(worker_id)
         end

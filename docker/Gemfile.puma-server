@@ -12,3 +12,6 @@ gem "puma"
 # released gem still spin-polls LINDEX, which is the contention ceiling.
 gem "specwrk-store-redis_adapter", github: "scottjacobsen/specwrk-store-redis_adapter", branch: "main"
 gem "msgpack" # optional payload serializer (SPECWRK_STORE_SERIALIZER=msgpack)
+# Prometheus /metrics on a separate plain-HTTP port; activated from
+# docker/puma.rb. Runs in the cluster master so the scrape covers all workers.
+gem "puma-metrics"

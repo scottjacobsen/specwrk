@@ -114,6 +114,24 @@ RSpec.describe Specwrk::Web::App do
       it { is_expected.to eq 109 }
     end
 
+    context "GET /metrics" do
+      let(:http_method) { "GET" }
+      let(:path) { "/metrics" }
+
+      before { stub_endpoint(Specwrk::Web::Endpoints::Metrics, 110) }
+
+      it { is_expected.to eq 110 }
+    end
+
+    context "HEAD /metrics" do
+      let(:http_method) { "HEAD" }
+      let(:path) { "/metrics" }
+
+      before { stub_endpoint(Specwrk::Web::Endpoints::Metrics, 110) }
+
+      it { is_expected.to eq 110 }
+    end
+
     context "GET /heartbeat" do
       let(:http_method) { "GET" }
       let(:path) { "/heartbeat" }
@@ -175,6 +193,18 @@ RSpec.describe Specwrk::Web::App do
       before { stub_endpoint(Specwrk::Web::Endpoints::CompleteAndPop, 107) }
 
       it { is_expected.to eq 107 }
+    end
+  end
+
+  describe ".rackup auth exclusions" do
+    let(:mock_request) { Rack::MockRequest.new(described_class.rackup.to_app) }
+
+    before { stub_const("ENV", {"SPECWRK_SRV_KEY" => "sekret", "SPECWRK_SRV_STORE_URI" => "memory:///"}) }
+
+    it "serves /metrics and /health without credentials while /pop still requires them" do
+      expect(mock_request.get("/metrics").status).to eq(200)
+      expect(mock_request.get("/health").status).to eq(200)
+      expect(mock_request.post("/pop").status).to eq(401)
     end
   end
 end

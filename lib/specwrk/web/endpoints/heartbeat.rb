@@ -7,6 +7,8 @@ module Specwrk
     module Endpoints
       class Heartbeat < Base
         def with_response
+          record_worker_contact!
+
           ok
         end
       end

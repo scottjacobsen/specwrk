@@ -23,6 +23,11 @@ module Specwrk
             pending.merge!(examples_with_run_times)
           end
 
+          # Register the run so /metrics can enumerate it; entries age out of
+          # the index at scrape time (there is no reliable teardown request in
+          # a CI run to hook instead).
+          runs_index[run_id] = Time.now.to_i
+
           ok
         end
 

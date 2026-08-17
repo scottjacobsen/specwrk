@@ -45,6 +45,39 @@ RSpec.describe Specwrk::BucketStore do
     end
   end
 
+  describe "#example_count" do
+    subject { instance.example_count }
+
+    context "examples not set" do
+      it { is_expected.to eq(0) }
+    end
+
+    context "examples set through the writer" do
+      before { instance.examples = [1, 2, 3] }
+
+      it "reads the stored count without the payload" do
+        expect(instance[described_class::EXAMPLE_COUNT_KEY]).to eq(3)
+        expect(instance.example_count).to eq(3)
+      end
+    end
+
+    context "bucket written before the count field existed" do
+      before { instance[described_class::EXAMPLES_KEY] = [1, 2] }
+
+      it { is_expected.to eq(2) }
+    end
+
+    context "examples cleared through the writer" do
+      before do
+        instance.examples = [1, 2]
+        instance.examples = []
+      end
+
+      it { is_expected.to eq(0) }
+      it { expect(instance[described_class::EXAMPLE_COUNT_KEY]).to be_nil }
+    end
+  end
+
   describe "#clear" do
     before { instance.examples = ["foo"] }
 

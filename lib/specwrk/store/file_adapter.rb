@@ -71,6 +71,12 @@ module Specwrk
         known_key_pairs.keys
       end
 
+      # Entry count without base64-decoding every filename back into a key;
+      # counts ALL fields, ____internal ones included, matching #keys.length.
+      def size
+        Dir.entries(path).count { |filename| filename.end_with? self.class.ext }
+      end
+
       def clear
         FileUtils.rm_rf(path)
         FileUtils.mkdir_p(path)

@@ -20,11 +20,18 @@ module Specwrk
         # heartbeat-alive, so never reclaimed. Record each response against the
         # client-sent request id and replay it verbatim for a duplicate.
         def idempotent
-          return yield if request_id.empty?
+          if request_id.empty?
+            record_worker_contact!
+            return yield
+          end
 
           replay = worker.replayable_response(request_id)
           return replay if replay
 
+          # Record contact only past the replay check: a replayed gone-home
+          # 410 must not resurrect the index entry its original delivery
+          # removed (see with_pop_response).
+          record_worker_contact!
           yield.tap { |response| worker.record_response!(request_id, response) }
         end
 
@@ -68,6 +75,12 @@ module Specwrk
             # requeues it, nobody is left to run it and the run "drains" with
             # examples that never ran. 404 instead keeps the pollers around until
             # a scan reclaims the bucket and hands it back out.
+            #
+            # The 410 is this worker's clean exit — drop it from the workers
+            # index so /metrics counts as "stale" only workers that vanished
+            # mid-run, not everyone who finished and went home.
+            workers_index.delete(worker_id) unless worker_id.empty?
+
             [410, {"content-type" => "text/plain"}, ["That's a good lad. Run along now and go home."]]
           else
             not_found

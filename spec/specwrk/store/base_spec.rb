@@ -86,6 +86,29 @@ RSpec.describe Specwrk::Store do
       it { is_expected.to eq(2) }
     end
 
+    describe "#size" do
+      before do
+        instance["a"] = 1
+        instance["____secret"] = 2
+      end
+
+      it "counts every field, ____internal ones included, unlike #length" do
+        expect(instance.size).to eq(2)
+        expect(instance.length).to eq(1)
+      end
+
+      context "when the adapter predates #size" do
+        before do
+          legacy_adapter = double("legacy adapter", keys: %w[a b ____c])
+          allow(instance).to receive(:adapter).and_return(legacy_adapter)
+        end
+
+        it "falls back to counting the adapter's keys" do
+          expect(instance.size).to eq(3)
+        end
+      end
+    end
+
     describe "#delete" do
       subject { instance.delete("key") }
 

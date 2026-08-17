@@ -25,6 +25,12 @@ module Specwrk
         store.keys
       end
 
+      # Field count without materializing the key array; counts ALL fields,
+      # ____internal ones included, matching #keys.length.
+      def size
+        store.size
+      end
+
       def clear
         store.clear
       end

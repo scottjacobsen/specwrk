@@ -105,6 +105,17 @@ RSpec.describe Specwrk::Store::FileAdapter do
     it { is_expected.to match_array(keys) }
   end
 
+  describe "#size" do
+    subject { instance.size }
+
+    before do
+      write(:a, "1")
+      write(:____internal, "2")
+    end
+
+    it { is_expected.to eq(2) }
+  end
+
   describe "#clear" do
     subject { instance.clear }
 

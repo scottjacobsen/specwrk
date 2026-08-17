@@ -59,6 +59,18 @@ module Specwrk
       keys.length
     end
 
+    # Raw field count, ____internal bookkeeping fields included (unlike
+    # #length, which counts only the filtered #keys). Prefers the adapter's
+    # cheap count when it has one: on a store with tens of thousands of
+    # fields (e.g. run_times), #keys transfers every field name just to
+    # count them — too expensive for a per-scrape read path like /metrics.
+    # The fallback keeps older adapter gems that predate #size working.
+    def size
+      return adapter.size if adapter.respond_to?(:size)
+
+      adapter.keys.length
+    end
+
     def any?
       !empty?
     end

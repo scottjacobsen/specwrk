@@ -34,6 +34,17 @@ RSpec.describe Specwrk::Store::MemoryAdapter do
     it { is_expected.to match_array(%w[a b]) }
   end
 
+  describe "#size" do
+    subject { instance.size }
+
+    before do
+      instance["a"] = 1
+      instance["____internal"] = 2
+    end
+
+    it { is_expected.to eq(2) }
+  end
+
   describe "#clear" do
     subject { instance.clear }
 

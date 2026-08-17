@@ -26,6 +26,12 @@ RSpec.describe Specwrk::Web::Endpoints::Seed do
       expect(Specwrk::BucketStore.new(datastore_uri, run_scope("pending", "buckets", bucket_id)).examples.map { |ex| ex[:id] }).to eq(["a.rb:1"])
     end
     it { expect { subject }.to change { pending.reload.max_retries }.from(0).to(42) }
+
+    it "registers the run in the runs index for /metrics enumeration" do
+      runs_index = Specwrk::Store.new(datastore_uri, "runs_index")
+
+      expect { subject }.to change { runs_index.reload[run_id] }.from(nil).to(be_within(5).of(Time.now.to_i))
+    end
   end
 
   context "merged with  sorted by file" do
