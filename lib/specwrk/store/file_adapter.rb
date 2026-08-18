@@ -10,6 +10,11 @@ require "specwrk/store/base_adapter"
 module Specwrk
   class Store
     class FileAdapter < BaseAdapter
+      # Accepted for parity with the Redis adapter, ignored: expiry matters
+      # for a long-lived server backed by Redis, while file stores are
+      # cleaned up by the CLI lifecycle.
+      attr_accessor :ttl
+
       @work_queue = Queue.new
       @threads = []
 

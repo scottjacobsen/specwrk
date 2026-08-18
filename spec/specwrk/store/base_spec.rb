@@ -4,6 +4,7 @@ require "tempfile"
 require "securerandom"
 
 require "specwrk/store"
+require "specwrk/store/base_adapter"
 
 RSpec.describe Specwrk::Store do
   describe ".adapter_klass" do
@@ -39,6 +40,32 @@ RSpec.describe Specwrk::Store do
       end
 
       it { is_expected.to eq(Specwrk::Store::RedisAdapter) }
+    end
+  end
+
+  describe "ttl handoff" do
+    let(:scope) { SecureRandom.uuid }
+
+    it "assigns the ttl to an adapter that supports it" do
+      instance = described_class.new("memory:///", scope, ttl: 60)
+
+      expect(instance.send(:adapter).ttl).to eq(60)
+    end
+
+    it "leaves the adapter's ttl unset when the store has none" do
+      instance = described_class.new("memory:///", scope)
+
+      expect(instance.send(:adapter).ttl).to be_nil
+    end
+
+    it "skips adapters that predate ttl support" do
+      # The released redis adapter gem's shape: BaseAdapter with no ttl=
+      legacy_klass = Class.new(Specwrk::Store::BaseAdapter)
+      allow(described_class).to receive(:adapter_klass).and_return(legacy_klass)
+
+      instance = described_class.new("memory:///", scope, ttl: 60)
+
+      expect(instance.send(:adapter)).to be_a(legacy_klass)
     end
   end
 

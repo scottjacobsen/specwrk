@@ -5,6 +5,11 @@ require "specwrk/store/base_adapter"
 module Specwrk
   class Store
     class MemoryAdapter < BaseAdapter
+      # Accepted for parity with the Redis adapter, ignored: expiry matters
+      # for a long-lived server backed by Redis, while memory stores live and
+      # die with the process.
+      attr_accessor :ttl
+
       @@stores = Hash.new { |hash, key| hash[key] = {} }
 
       class << self

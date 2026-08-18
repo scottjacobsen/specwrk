@@ -69,25 +69,28 @@ module Specwrk
         end
 
         def pending
-          @pending ||= PendingStore.new(ENV.fetch("SPECWRK_SRV_STORE_URI", "memory:///"), File.join(run_scope, "pending"))
+          @pending ||= PendingStore.new(ENV.fetch("SPECWRK_SRV_STORE_URI", "memory:///"), File.join(run_scope, "pending"), ttl: run_ttl)
         end
 
         def processing
-          @processing ||= ProcessingStore.new(ENV.fetch("SPECWRK_SRV_STORE_URI", "memory:///"), File.join(run_scope, "processing"))
+          @processing ||= ProcessingStore.new(ENV.fetch("SPECWRK_SRV_STORE_URI", "memory:///"), File.join(run_scope, "processing"), ttl: run_ttl)
         end
 
         def completed
-          @completed ||= CompletedStore.new(ENV.fetch("SPECWRK_SRV_STORE_URI", "memory:///"), File.join(run_scope, "completed"))
+          @completed ||= CompletedStore.new(ENV.fetch("SPECWRK_SRV_STORE_URI", "memory:///"), File.join(run_scope, "completed"), ttl: run_ttl)
         end
 
         def failure_counts
-          @failure_counts ||= Store.new(ENV.fetch("SPECWRK_SRV_STORE_URI", "memory:///"), File.join(run_scope, "failure_counts"))
+          @failure_counts ||= Store.new(ENV.fetch("SPECWRK_SRV_STORE_URI", "memory:///"), File.join(run_scope, "failure_counts"), ttl: run_ttl)
         end
 
         def metadata
-          @metadata ||= Store.new(ENV.fetch("SPECWRK_SRV_STORE_URI", "memory:///"), File.join(run_scope, "metadata"))
+          @metadata ||= Store.new(ENV.fetch("SPECWRK_SRV_STORE_URI", "memory:///"), File.join(run_scope, "metadata"), ttl: run_ttl)
         end
 
+        # run_times and runs_index are the deliberate permanent set — no ttl.
+        # Timing data seeds future runs' bucketing, and the runs index is
+        # pruned explicitly by /metrics.
         def run_times
           @run_times ||= Store.new(ENV.fetch("SPECWRK_SRV_STORE_URI", "file://#{File.join(Dir.tmpdir, "specwrk")}"), "run_times")
         end
@@ -105,7 +108,7 @@ module Specwrk
         # enumerate a run's workers without a keyspace scan. Worker stores
         # themselves are keyed {run}/workers/<id> and thus unenumerable.
         def workers_index
-          @workers_index ||= Store.new(ENV.fetch("SPECWRK_SRV_STORE_URI", "memory:///"), File.join(run_scope, "workers_index"))
+          @workers_index ||= Store.new(ENV.fetch("SPECWRK_SRV_STORE_URI", "memory:///"), File.join(run_scope, "workers_index"), ttl: run_ttl)
         end
 
         # Called from the worker-driven endpoints only — /heartbeat for idle
@@ -134,7 +137,16 @@ module Specwrk
         end
 
         def worker_store_for(id)
-          WorkerStore.new(ENV.fetch("SPECWRK_SRV_STORE_URI", "memory:///"), File.join(run_scope, "workers", id))
+          WorkerStore.new(ENV.fetch("SPECWRK_SRV_STORE_URI", "memory:///"), File.join(run_scope, "workers", id), ttl: run_ttl)
+        end
+
+        # Lifetime for everything a run writes. A queue server outlives its
+        # runs by design, so without expiry every run's stores accumulate in
+        # the backing store forever; a day comfortably covers reruns and
+        # post-run inspection. "0" or an empty value disables expiry.
+        def run_ttl
+          ttl = ENV.fetch("SPECWRK_SRV_RUN_TTL", "86400").to_i
+          ttl.positive? ? ttl : nil
         end
 
         def run_id

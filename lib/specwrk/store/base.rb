@@ -32,9 +32,10 @@ module Specwrk
       end
     end
 
-    def initialize(uri_string, scope)
+    def initialize(uri_string, scope, ttl: nil)
       @uri = URI(uri_string)
       @scope = scope
+      @ttl = ttl
     end
 
     def [](key)
@@ -110,10 +111,16 @@ module Specwrk
 
     private
 
-    attr_reader :uri, :scope
+    attr_reader :uri, :scope, :ttl
 
+    # The ttl is assigned after construction rather than passed to the
+    # constructor so every adapter keeps the shared (uri, scope) signature,
+    # and guarded because released adapter gems may predate ttl support —
+    # stores on such adapters simply never expire, as before.
     def adapter
-      @adapter ||= self.class.adapter_klass(uri).new uri, scope
+      @adapter ||= self.class.adapter_klass(uri).new(uri, scope).tap do |instance|
+        instance.ttl = ttl if ttl && instance.respond_to?(:ttl=)
+      end
     end
   end
 end

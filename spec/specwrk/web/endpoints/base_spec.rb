@@ -80,4 +80,78 @@ RSpec.describe Specwrk::Web::Endpoints::Base do
       expect(Specwrk::Store).to have_received(:with_lock).with(anything, "{main}")
     end
   end
+
+  # Run-scoped stores expire (SPECWRK_SRV_RUN_TTL, default one day) so a
+  # long-lived server doesn't accumulate every run's data forever; the
+  # cross-run stores are the deliberate permanent set.
+  context "run-scoped store ttl" do
+    let(:memory_uri) { "memory:///" }
+    let(:env_vars) { {"SPECWRK_SRV_STORE_URI" => memory_uri} }
+
+    before { Specwrk::Store::MemoryAdapter.clear }
+
+    def spy_store_constructors!
+      allow(Specwrk::PendingStore).to receive(:new).and_call_original
+      allow(Specwrk::ProcessingStore).to receive(:new).and_call_original
+      allow(Specwrk::CompletedStore).to receive(:new).and_call_original
+      allow(Specwrk::WorkerStore).to receive(:new).and_call_original
+      allow(Specwrk::Store).to receive(:new).and_call_original
+    end
+
+    it "constructs every run-scoped store with the default 24h ttl" do
+      spy_store_constructors!
+
+      instance.send(:pending)
+      instance.send(:processing)
+      instance.send(:completed)
+      instance.send(:failure_counts)
+      instance.send(:metadata)
+      instance.send(:workers_index)
+      instance.send(:worker)
+
+      expect(Specwrk::PendingStore).to have_received(:new).with(memory_uri, "{main}/pending", ttl: 86400)
+      expect(Specwrk::ProcessingStore).to have_received(:new).with(memory_uri, "{main}/processing", ttl: 86400)
+      expect(Specwrk::CompletedStore).to have_received(:new).with(memory_uri, "{main}/completed", ttl: 86400)
+      expect(Specwrk::WorkerStore).to have_received(:new).with(memory_uri, "{main}/workers/foobar-0", ttl: 86400)
+      expect(Specwrk::Store).to have_received(:new).with(memory_uri, "{main}/failure_counts", ttl: 86400)
+      expect(Specwrk::Store).to have_received(:new).with(memory_uri, "{main}/metadata", ttl: 86400)
+      expect(Specwrk::Store).to have_received(:new).with(memory_uri, "{main}/workers_index", ttl: 86400)
+    end
+
+    it "constructs the cross-run stores without a ttl" do
+      spy_store_constructors!
+
+      instance.send(:run_times)
+      instance.send(:runs_index)
+
+      expect(Specwrk::Store).to have_received(:new).with(memory_uri, "run_times")
+      expect(Specwrk::Store).to have_received(:new).with(memory_uri, "runs_index")
+    end
+
+    context "with SPECWRK_SRV_RUN_TTL set" do
+      let(:env_vars) { {"SPECWRK_SRV_STORE_URI" => memory_uri, "SPECWRK_SRV_RUN_TTL" => "120"} }
+
+      it "uses the configured ttl" do
+        spy_store_constructors!
+
+        instance.send(:pending)
+
+        expect(Specwrk::PendingStore).to have_received(:new).with(memory_uri, "{main}/pending", ttl: 120)
+      end
+    end
+
+    context "with SPECWRK_SRV_RUN_TTL=0" do
+      let(:env_vars) { {"SPECWRK_SRV_STORE_URI" => memory_uri, "SPECWRK_SRV_RUN_TTL" => "0"} }
+
+      it "disables expiry" do
+        spy_store_constructors!
+
+        instance.send(:pending)
+        instance.send(:metadata)
+
+        expect(Specwrk::PendingStore).to have_received(:new).with(memory_uri, "{main}/pending", ttl: nil)
+        expect(Specwrk::Store).to have_received(:new).with(memory_uri, "{main}/metadata", ttl: nil)
+      end
+    end
+  end
 end

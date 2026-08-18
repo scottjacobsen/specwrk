@@ -80,7 +80,7 @@ module Specwrk
     end
 
     def bucket_store_for(bucket_id)
-      BucketStore.new(uri.to_s, File.join(scope, "buckets", bucket_id))
+      BucketStore.new(uri.to_s, File.join(scope, "buckets", bucket_id), ttl: ttl)
     end
 
     def delete_bucket(bucket_id)

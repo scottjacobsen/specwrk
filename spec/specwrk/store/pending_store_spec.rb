@@ -18,6 +18,18 @@ RSpec.describe Specwrk::PendingStore do
     Specwrk::BucketStore.new(uri_string, File.join(scope, "buckets", id))
   end
 
+  describe "#bucket_store_for" do
+    it "threads its ttl into the bucket stores it creates" do
+      store = described_class.new(uri_string, scope, ttl: 60)
+      allow(Specwrk::BucketStore).to receive(:new).and_call_original
+
+      store.bucket_store_for("abc123")
+
+      expect(Specwrk::BucketStore).to have_received(:new)
+        .with(uri_string, File.join(scope, "buckets", "abc123"), ttl: 60)
+    end
+  end
+
   describe "#run_time_bucket_maximum=" do
     subject { instance.run_time_bucket_maximum = 3 }
 
