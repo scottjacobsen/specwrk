@@ -48,18 +48,30 @@ module Specwrk
       bucket_ids.sum { |bucket_id| bucket_store_for(bucket_id).example_count }
     end
 
+    # Every bucket goes out in one batch rather than one write per bucket:
+    # a seed of a large suite groups into thousands of buckets, and against a
+    # networked store that was thousands of sequential round trips blocking
+    # the whole fleet. The bucket ids are still written once, after the
+    # payloads land, so a reader never sees an id whose bucket is missing.
     def merge!(hash, prepend: false)
       return self if hash.nil? || hash.empty?
 
-      buckets = grouped_examples(hash.values)
-      new_bucket_ids = buckets.map { |examples| write_bucket(examples) }
+      new_bucket_ids = []
+      payloads = grouped_examples(hash.values).to_h do |examples|
+        bucket_id = SecureRandom.uuid
+        new_bucket_ids << bucket_id
+
+        [bucket_scope(bucket_id), BucketStore.payload_for(examples)]
+      end
+
+      multi_scope_write(payloads)
 
       self.bucket_ids = prepend ? new_bucket_ids + bucket_ids : bucket_ids + new_bucket_ids
       self
     end
 
     def clear
-      bucket_ids.each { |bucket_id| delete_bucket(bucket_id) }
+      multi_scope_clear(bucket_ids.map { |bucket_id| bucket_scope(bucket_id) })
       @bucket_ids = nil
 
       super
@@ -80,7 +92,11 @@ module Specwrk
     end
 
     def bucket_store_for(bucket_id)
-      BucketStore.new(uri.to_s, File.join(scope, "buckets", bucket_id), ttl: ttl)
+      BucketStore.new(uri.to_s, bucket_scope(bucket_id), ttl: ttl)
+    end
+
+    def bucket_scope(bucket_id)
+      File.join(scope, "buckets", bucket_id)
     end
 
     def delete_bucket(bucket_id)

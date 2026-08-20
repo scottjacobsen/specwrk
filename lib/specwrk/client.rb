@@ -6,6 +6,7 @@ require "openssl"
 require "json"
 require "securerandom"
 require "time"
+require "zlib"
 
 require "specwrk"
 
@@ -15,6 +16,17 @@ Specwrk.net_http = Net::HTTP
 
 module Specwrk
   class Client
+    # POST bodies at least this large go out gzipped. The seed for a large
+    # suite is tens of megabytes of JSON that deflates ~25x, so the fraction
+    # of a second it costs to compress buys back most of the upload; below
+    # the threshold there is no transfer worth the CPU on either end.
+    #
+    # The server inflates any body carrying Content-Encoding: gzip, and one
+    # that predates that support would try to JSON.parse the compressed
+    # bytes — so a client this new REQUIRES a server at least as new. Deploy
+    # the server first.
+    GZIP_MIN_BYTES = 64 * 1024
+
     def self.connect?
       http = build_http
       http.start
@@ -168,6 +180,8 @@ module Specwrk
     end
 
     def post(path, headers: default_headers, body: nil)
+      body, headers = maybe_gzip(body, headers)
+
       request = Specwrk.net_http::Post.new(path, headers)
       request.body = body if body
 
@@ -186,6 +200,17 @@ module Specwrk
       request.body = body if body
 
       make_request(request)
+    end
+
+    # Non-mutating on both arguments: default_headers is memoized and shared
+    # by every request this client makes, so the gzip marker has to go on a
+    # copy. Compressing here, before the request object is built, also means
+    # make_request's retries re-send the already-compressed body rather than
+    # deflating it again per attempt.
+    def maybe_gzip(body, headers)
+      return [body, headers] if body.nil? || body.bytesize < GZIP_MIN_BYTES
+
+      [Zlib.gzip(body), headers.merge("Content-Encoding" => "gzip")]
     end
 
     # The retry loop lives INSIDE @mutex.synchronize (unlike a plain rescue on

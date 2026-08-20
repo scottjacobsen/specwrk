@@ -14,7 +14,7 @@ RSpec.describe Specwrk::CLI::Seed do
     end
 
     around do |ex|
-      saved = %w[SPECWRK_SRV_URI SPECWRK_SRV_KEY SPECWRK_RUN SPECWRK_TIMEOUT SPECWRK_NETWORK_RETRIES SPECWRK_SEED].to_h { |k| [k, ENV[k]] }
+      saved = %w[SPECWRK_SRV_URI SPECWRK_SRV_KEY SPECWRK_RUN SPECWRK_TIMEOUT SPECWRK_NETWORK_RETRIES SPECWRK_SEED SPECWRK_SEED_JOBS].to_h { |k| [k, ENV[k]] }
       ex.run
       saved.each { |k, v| v.nil? ? ENV.delete(k) : ENV[k] = v }
     end
@@ -35,9 +35,24 @@ RSpec.describe Specwrk::CLI::Seed do
       expect(Specwrk::Client).not_to receive(:wait_for_server!)
 
       expect {
-        expect { instance.call(max_retries: 0, dir: [], **client_env) }
+        expect { instance.call(max_retries: 0, jobs: 1, dir: [], **client_env) }
           .to raise_error(SystemExit) { |e| expect(e.status).to eq(1) }
       }.to output(/no examples/i).to_stderr
+    end
+
+    it "enumerates with the requested number of jobs" do
+      expect(Specwrk::ListExamples).to receive(:new)
+        .with(["spec"], jobs: 4)
+        .and_return(instance_double(Specwrk::ListExamples, examples: []))
+
+      expect {
+        expect { instance.call(max_retries: 0, jobs: 4, dir: [], **client_env) }
+          .to raise_error(SystemExit)
+      }.to output(/no examples/i).to_stderr
+
+      # Exported so the enumeration a `specwrk start` subprocess runs picks it
+      # up too.
+      expect(ENV["SPECWRK_SEED_JOBS"]).to eq("4")
     end
   end
 end

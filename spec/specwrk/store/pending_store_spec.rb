@@ -430,6 +430,29 @@ RSpec.describe Specwrk::PendingStore do
     end
   end
 
+  describe "#clear" do
+    before { stub_const("ENV", ENV.to_h.merge("SPECWRK_SRV_GROUP_BY" => "file")) }
+
+    # A re-seed clears the previous queue, and its buckets now go out as one
+    # batch rather than a delete apiece — but every bucket still has to be
+    # gone, not just the id list that pointed at them.
+    it "drops every bucket's payload along with the ids" do
+      examples = {
+        "a.rb:1": {id: "a.rb:1", file_path: "a.rb"},
+        "b.rb:1": {id: "b.rb:1", file_path: "b.rb"}
+      }
+
+      instance.merge!(examples)
+      bucket_ids = instance.bucket_ids
+      expect(bucket_ids.length).to eq(2)
+
+      instance.clear
+
+      expect(instance.reload.bucket_ids).to eq([])
+      bucket_ids.each { |bucket_id| expect(bucket_for(bucket_id).examples).to eq([]) }
+    end
+  end
+
   describe "#shift_bucket" do
     it "returns nil when no buckets remain" do
       expect(instance.shift_bucket).to be_nil

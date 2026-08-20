@@ -14,8 +14,15 @@ module Specwrk
         self[EXAMPLES_KEY] = nil
         self[EXAMPLE_COUNT_KEY] = nil
       else
-        merge!(EXAMPLES_KEY => val, EXAMPLE_COUNT_KEY => val.length)
+        merge!(self.class.payload_for(val))
       end
+    end
+
+    # The fields #examples= writes, for callers filling many buckets in one
+    # batch (PendingStore#merge!) that never build a BucketStore per bucket.
+    # Keeps a bucket's on-the-wire shape defined in one place.
+    def self.payload_for(examples)
+      {EXAMPLES_KEY => examples, EXAMPLE_COUNT_KEY => examples.length}
     end
 
     def examples

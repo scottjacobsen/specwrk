@@ -559,6 +559,42 @@ RSpec.describe Specwrk::Client do
         expect { subject }.to raise_error(Specwrk::UnhandledResponseError, /500: boom/)
       end
     end
+
+    # A seed for a large suite is tens of megabytes of JSON that gzip shrinks
+    # ~25x, so anything past the threshold goes out compressed. The server
+    # inflates bodies marked Content-Encoding: gzip; one too old to do that
+    # would try to parse the compressed bytes, so the server ships first.
+    context "when the body is past the compression threshold" do
+      let(:examples) do
+        Array.new(2_000) { |n| {id: "./spec/a_spec.rb[1:#{n}]", file_path: "./spec/a_spec.rb"} }
+      end
+
+      it "gzips the body and marks it, leaving the JSON content type in place" do
+        stub_request(:post, "#{base_uri}/seed").to_return(status: 200)
+
+        expect(subject).to be true
+
+        expect(WebMock).to have_requested(:post, "#{base_uri}/seed")
+          .with(headers: headers.merge("Content-Encoding" => "gzip", "Content-Type" => "application/json")) { |request|
+            request.body.bytesize < described_class::GZIP_MIN_BYTES &&
+              JSON.parse(Zlib.gunzip(request.body), symbolize_names: true) == {max_retries: max_retries, examples: examples}
+          }
+      end
+    end
+
+    context "when the body is below the compression threshold" do
+      it "sends it plain, as an older server expects" do
+        stub_request(:post, "#{base_uri}/seed").to_return(status: 200)
+
+        expect(subject).to be true
+
+        expect(WebMock).to have_requested(:post, "#{base_uri}/seed")
+          .with { |request|
+            request.headers["Content-Encoding"].nil? &&
+              request.body == {max_retries: max_retries, examples: examples}.to_json
+          }
+      end
+    end
   end
 
   describe "#report" do

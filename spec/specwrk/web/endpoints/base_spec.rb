@@ -36,6 +36,48 @@ RSpec.describe Specwrk::Web::Endpoints::Base do
     it { expect { response }.to change { worker.reload.last_seen_at } }
   end
 
+  # A large suite's seed body is tens of megabytes of JSON, so clients may
+  # send it gzipped. Inflation lives in the shared body reader, which is what
+  # makes the parsed payload identical either way for every endpoint.
+  context "gzipped request bodies" do
+    subject(:payload) { instance.send(:payload) }
+
+    let(:request_method) { "POST" }
+    let(:json) { JSON.generate(max_retries: 42, examples: [{id: "a.rb:1", file_path: "a.rb"}]) }
+    let(:parsed) { {max_retries: 42, examples: [{id: "a.rb:1", file_path: "a.rb"}]} }
+
+    context "with Content-Encoding: gzip" do
+      let(:body) { Zlib.gzip(json) }
+      let(:env) { super().merge("HTTP_CONTENT_ENCODING" => "gzip") }
+
+      it { is_expected.to eq(parsed) }
+    end
+
+    context "with the header cased and padded as a proxy might rewrite it" do
+      let(:body) { Zlib.gzip(json) }
+      let(:env) { super().merge("HTTP_CONTENT_ENCODING" => " GZIP ") }
+
+      it { is_expected.to eq(parsed) }
+    end
+
+    # The compatibility half: a client that predates compression sends no
+    # Content-Encoding, and its body must still be read verbatim.
+    context "without Content-Encoding" do
+      let(:body) { json }
+
+      it { is_expected.to eq(parsed) }
+    end
+
+    context "with an empty body" do
+      let(:body) { "" }
+      let(:env) { super().merge("HTTP_CONTENT_ENCODING" => "gzip") }
+
+      it "has no payload rather than failing to inflate nothing" do
+        expect(payload).to be_nil
+      end
+    end
+  end
+
   # Run-scoped keys wrap the run id in a Redis Cluster hash tag so a run's
   # stores and lock all land in the same cluster slot.
   context "datastore key format" do

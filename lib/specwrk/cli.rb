@@ -179,9 +179,10 @@ module Specwrk
 
       desc "Seed the server with a list of specs for the run"
       option :max_retries, default: 0, desc: "Number of times an example will be re-run should it fail"
+      option :jobs, type: :integer, default: ENV.fetch("SPECWRK_SEED_JOBS", "1"), aliases: ["-j"], desc: "Number of forked processes used to enumerate examples. Set SPECWRK_PRELOAD too so the application boots once before the fork. Overrides SPECWRK_SEED_JOBS"
       argument :dir, type: :array, required: false, desc: "Relative spec directory to run against, default: spec/"
 
-      def call(max_retries:, dir:, **args)
+      def call(max_retries:, jobs:, dir:, **args)
         dir = ["spec"] if dir.length.zero?
 
         self.class.setup(**args)
@@ -190,7 +191,8 @@ module Specwrk
         require "specwrk/client"
 
         ENV["SPECWRK_SEED"] = "1"
-        examples = ListExamples.new(dir).examples
+        ENV["SPECWRK_SEED_JOBS"] = jobs.to_s
+        examples = ListExamples.new(dir, jobs: jobs).examples
 
         # An empty enumeration almost always means the spec files failed to
         # LOAD during discovery (e.g. the app's spec helper needed a database

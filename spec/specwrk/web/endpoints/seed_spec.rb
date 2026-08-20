@@ -34,6 +34,24 @@ RSpec.describe Specwrk::Web::Endpoints::Seed do
     end
   end
 
+  # The seed body is by far the largest request specwrk sends — tens of
+  # megabytes of JSON for a large suite, which gzip shrinks ~25x. The
+  # compressed body has to seed exactly what the plain one does.
+  context "a gzipped request body" do
+    let(:body) { Zlib.gzip(JSON.generate(max_retries: 42, examples: [{id: "a.rb:1", file_path: "a.rb", run_time: 0.1}])) }
+    let(:env) { super().merge("HTTP_CONTENT_ENCODING" => "gzip") }
+
+    it { is_expected.to eq(ok) }
+
+    it "seeds the same examples and metadata a plain body would" do
+      subject
+
+      bucket_id = pending.reload.shift_bucket
+      expect(Specwrk::BucketStore.new(datastore_uri, run_scope("pending", "buckets", bucket_id)).examples.map { |ex| ex[:id] }).to eq(["a.rb:1"])
+      expect(pending.reload.max_retries).to eq(42)
+    end
+  end
+
   context "merged with  sorted by file" do
     let(:body) do
       JSON.generate(examples: [

@@ -7,10 +7,13 @@ require "tempfile"
 require "time"
 
 require "specwrk/client"
+require "specwrk/preloadable"
 require "specwrk/worker/executor"
 
 module Specwrk
   class Worker
+    include Preloadable
+
     def self.run!
       new.run
     end
@@ -100,24 +103,11 @@ module Specwrk
       1
     end
 
-    # Boot the application (e.g. Rails) once in this long-lived parent process so
-    # every per-bucket child fork inherits a fully-booted app whose load-time
-    # registrations (model callbacks, subscribers, constants, RSpec config) have
-    # run exactly once. SPECWRK_PRELOAD names a file to require, e.g. the app's
-    # spec/rails_helper. Without it the app boots lazily inside the first child.
+    # Boot the application once in this long-lived parent process so every
+    # per-bucket child fork inherits it. Without SPECWRK_PRELOAD the app boots
+    # lazily inside the first child instead.
     def preload!
-      preload = ENV["SPECWRK_PRELOAD"].to_s
-      return if preload.empty?
-
-      # Put the conventional RSpec load paths in place (mirrors `rspec -Ilib
-      # -Ispec`) so the preloaded helper and its own requires (e.g. rails_helper's
-      # `require "spec_helper"`) resolve the same way a normal rspec run would.
-      ["lib", "spec", File.dirname(preload)].each do |dir|
-        path = File.expand_path(dir)
-        $LOAD_PATH.unshift(path) if File.directory?(path) && !$LOAD_PATH.include?(path)
-      end
-
-      require preload
+      return unless preload_app!
 
       # Drop the connections opened while booting so per-bucket children fork
       # from a clean, lock-free baseline and each reconnects on its own.

@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require "json"
+require "zlib"
 
 require "specwrk/store"
 
@@ -64,8 +65,19 @@ module Specwrk
           @payload ||= JSON.parse(body, symbolize_names: true)
         end
 
+        # Inflating here rather than in any one endpoint keeps compression
+        # invisible to everything downstream — the parsed payload is identical
+        # either way. A request without Content-Encoding is read exactly as
+        # before, so clients that predate compressed bodies keep working.
         def body
-          @body ||= request.body.read
+          @body ||= begin
+            raw = request.body.read
+            (gzipped_request? && !raw.empty?) ? Zlib.gunzip(raw) : raw
+          end
+        end
+
+        def gzipped_request?
+          request.get_header("HTTP_CONTENT_ENCODING").to_s.strip.casecmp?("gzip")
         end
 
         def pending

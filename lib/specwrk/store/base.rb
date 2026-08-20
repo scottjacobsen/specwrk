@@ -89,6 +89,21 @@ module Specwrk
       adapter.merge!(h2)
     end
 
+    # Merge into a whole family of sibling stores at once, keyed by scope —
+    # one pipelined round trip on adapters that batch, the same sequence of
+    # writes as before on those that don't. Scopes are absolute, as built by
+    # PendingStore#bucket_scope.
+    def multi_scope_write(scoped_hashes)
+      adapter.multi_scope_write(
+        scoped_hashes.transform_values { |hash| hash.transform_keys(&:to_s) }
+      )
+    end
+
+    # #clear for a whole family of sibling stores.
+    def multi_scope_clear(scopes)
+      adapter.multi_scope_clear(scopes)
+    end
+
     def clear
       adapter.clear
     end

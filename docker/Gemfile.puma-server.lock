@@ -1,6 +1,6 @@
 GIT
   remote: https://github.com/scottjacobsen/specwrk-store-redis_adapter.git
-  revision: 6b3ea549a2c0126991857f644f6acd03fd9e0ffd
+  revision: dce53f545a695380accbf5ac0b654f10e6b133e8
   branch: main
   specs:
     specwrk-store-redis_adapter (0.1.0)
@@ -89,6 +89,7 @@ DEPENDENCIES
 
 CHECKSUMS
   base64 (0.3.0) sha256=27337aeabad6ffae05c265c450490628ef3ebd4b67be58257393227588f5a97b
+  bundler (4.0.13) sha256=19f08be7f27022cf0b89f27da0b044ae075e8270a9ef44ad248a932614e1ca3b
   connection_pool (3.0.2) sha256=33fff5ba71a12d2aa26cb72b1db8bba2a1a01823559fb01d29eb74c286e62e0a
   dry-cli (1.4.1) sha256=b8015bb76c708aa8705a36faf694973e75eeeffca39b89c8e172dc6f66a7d874
   ffi (1.17.4) sha256=bcd1642e06f0d16fc9e09ac6d49c3a7298b9789bcb58127302f934e437d60acf
@@ -122,4 +123,4 @@ CHECKSUMS
   webrick (1.9.2) sha256=beb4a15fc474defed24a3bda4ffd88a490d517c9e4e6118c3edce59e45864131
 
 BUNDLED WITH
-  4.0.16
+  4.0.13

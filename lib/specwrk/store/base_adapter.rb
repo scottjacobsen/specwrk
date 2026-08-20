@@ -59,6 +59,26 @@ module Specwrk
         raise "Not implemented"
       end
 
+      # Write several scopes at once, given { scope => { key => value } }.
+      # Unlike the rest of this class these have a working default rather
+      # than raising: an adapter with no way to batch is still correct doing
+      # the writes one at a time, which is exactly what it did before the
+      # batch call existed. Adapters that can do better override — the Redis
+      # one collapses the whole set into a single pipelined round trip, which
+      # is the point of the call for the thousands of buckets a seed writes.
+      def multi_scope_write(scoped_hashes)
+        scoped_hashes.each { |other_scope, hash| adapter_for(other_scope).multi_write(hash) }
+
+        nil
+      end
+
+      # Bulk #clear across scopes; same default-and-override story.
+      def multi_scope_clear(scopes)
+        scopes.each { |other_scope| adapter_for(other_scope).clear }
+
+        nil
+      end
+
       def empty?
         raise "Not implemented"
       end
@@ -66,6 +86,17 @@ module Specwrk
       private
 
       attr_reader :uri, :scope
+
+      # A sibling adapter on the same backing store, carrying this one's ttl
+      # so batched writes expire like their single-scope equivalents. The ttl
+      # accessor is guarded because BaseAdapter itself declares none.
+      def adapter_for(other_scope)
+        return self if other_scope == @scope
+
+        self.class.new(uri, other_scope).tap do |instance|
+          instance.ttl = ttl if respond_to?(:ttl) && instance.respond_to?(:ttl=)
+        end
+      end
     end
   end
 end
