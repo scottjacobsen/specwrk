@@ -1,6 +1,6 @@
 GIT
   remote: https://github.com/scottjacobsen/specwrk-store-redis_adapter.git
-  revision: dce53f545a695380accbf5ac0b654f10e6b133e8
+  revision: d18b1529078ef63a19674330376be08758ce797a
   branch: main
   specs:
     specwrk-store-redis_adapter (0.1.0)

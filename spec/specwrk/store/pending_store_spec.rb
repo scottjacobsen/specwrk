@@ -78,6 +78,56 @@ RSpec.describe Specwrk::PendingStore do
 
       it { is_expected.to eq(3) }
       it { expect { instance.shift_bucket }.to change(instance, :example_count).from(3).to(1) }
+
+      # One batched read covering every bucket, not a read per bucket: against
+      # a networked store that was a round trip apiece, and this runs on the
+      # metrics scrape path where a large suite has thousands of buckets.
+      it "reads every bucket's count in a single batch call" do
+        expected = instance.bucket_ids.to_h do |bucket_id|
+          [instance.bucket_scope(bucket_id), [Specwrk::BucketStore::EXAMPLE_COUNT_KEY.to_s]]
+        end
+        allow(instance).to receive(:multi_scope_read).and_call_original
+
+        expect(instance.example_count).to eq(3)
+
+        expect(instance).to have_received(:multi_scope_read).with(expected).once
+      end
+
+      it "never touches the example payloads to count them" do
+        allow(Specwrk::BucketStore).to receive(:new).and_call_original
+
+        instance.example_count
+
+        expect(Specwrk::BucketStore).not_to have_received(:new)
+      end
+
+      it "reads nothing at all when there are no buckets" do
+        instance.bucket_ids = nil
+        allow(instance).to receive(:multi_scope_read).and_call_original
+
+        expect(instance.example_count).to eq(0)
+
+        expect(instance).not_to have_received(:multi_scope_read)
+      end
+    end
+
+    # The memory and file adapters have no batched read of their own and fall
+    # back to BaseAdapter's loop, so the sum has to come out the same whether
+    # or not the backing store can pipeline.
+    context "on an adapter without a batched read of its own" do
+      let(:uri_string) { "memory:///" }
+
+      before do
+        stub_const("ENV", ENV.to_h.merge("SPECWRK_SRV_GROUP_BY" => "file"))
+
+        instance.merge!({
+          "a.rb:1": {id: "a.rb:1", file_path: "a.rb"},
+          "a.rb:2": {id: "a.rb:2", file_path: "a.rb"},
+          "b.rb:1": {id: "b.rb:1", file_path: "b.rb"}
+        })
+      end
+
+      it { is_expected.to eq(3) }
     end
   end
 

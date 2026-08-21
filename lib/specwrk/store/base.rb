@@ -99,6 +99,17 @@ module Specwrk
       )
     end
 
+    # Read from a whole family of sibling stores at once, given
+    # { scope => [key, ...] } and answering { scope => { key => value } } —
+    # one pipelined round trip on adapters that batch, the same sequence of
+    # reads as before on those that don't. Keys are stringified like #[] does,
+    # so a symbol reads the same field a symbol wrote.
+    def multi_scope_read(scoped_keys)
+      adapter.multi_scope_read(
+        scoped_keys.transform_values { |read_keys| read_keys.map(&:to_s) }
+      )
+    end
+
     # #clear for a whole family of sibling stores.
     def multi_scope_clear(scopes)
       adapter.multi_scope_clear(scopes)

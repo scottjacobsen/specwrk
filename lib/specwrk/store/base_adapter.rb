@@ -72,6 +72,17 @@ module Specwrk
         nil
       end
 
+      # Read fields from several scopes at once, given { scope => [key, ...] }
+      # and answering { scope => { key => value } }. Same default-and-override
+      # story as multi_scope_write: correct one scope at a time, one pipelined
+      # round trip on the Redis adapter — which is the point of the call for
+      # the per-bucket counts a metrics scrape sums.
+      def multi_scope_read(scoped_keys)
+        scoped_keys.to_h do |other_scope, read_keys|
+          [other_scope, adapter_for(other_scope).multi_read(*read_keys)]
+        end
+      end
+
       # Bulk #clear across scopes; same default-and-override story.
       def multi_scope_clear(scopes)
         scopes.each { |other_scope| adapter_for(other_scope).clear }

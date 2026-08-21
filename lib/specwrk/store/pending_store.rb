@@ -42,10 +42,23 @@ module Specwrk
       @bucket_ids ||= self[BUCKET_IDS_KEY] || []
     end
 
-    # Total examples still queued, summed from each bucket's stored count —
-    # one small read per bucket, never the example payloads themselves.
+    # Total examples still queued, summed from every bucket's stored count in
+    # ONE batched read — never the example payloads themselves. A read per
+    # bucket was a round trip per bucket against a networked store, and this
+    # is on the metrics scrape path: a large suite's thousands of buckets made
+    # a single scrape cost tens of seconds.
+    #
+    # A bucket missing the count field contributes nothing. The field is
+    # written with the payload, so the only way to miss it is a bucket already
+    # popped and deleted since bucket_ids was read — which is genuinely no
+    # longer queued.
     def example_count
-      bucket_ids.sum { |bucket_id| bucket_store_for(bucket_id).example_count }
+      return 0 if bucket_ids.empty?
+
+      count_key = BucketStore::EXAMPLE_COUNT_KEY.to_s
+      counts = multi_scope_read(bucket_ids.to_h { |bucket_id| [bucket_scope(bucket_id), [count_key]] })
+
+      counts.sum { |_bucket_scope, fields| fields[count_key].to_i }
     end
 
     # Every bucket goes out in one batch rather than one write per bucket:
