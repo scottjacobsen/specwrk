@@ -15,6 +15,10 @@ module Specwrk
             with_lock do
               pending.reload
               processing.delete(*(completed_examples.keys + retry_examples.keys))
+              # This worker's bucket is fully reported; drop its in-flight
+              # index entry (with_pop_response writes a fresh one if another
+              # bucket is handed out below).
+              in_flight.delete(worker_id) unless worker_id.empty?
               pending.merge!(retry_examples)
             end
 

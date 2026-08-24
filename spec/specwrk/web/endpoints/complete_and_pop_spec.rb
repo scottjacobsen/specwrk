@@ -27,6 +27,10 @@ RSpec.describe Specwrk::Web::Endpoints::CompleteAndPop do
       }
     end
 
+    let(:existing_in_flight_data) do
+      {worker_id => {ids: ["a.rb:1", "a.rb:3", "a.rb:4", "a.rb:5"], processing_started_at: (Time.now - 10).to_i}}
+    end
+
     it { is_expected.to eq([410, {"content-type" => "text/plain", "x-specwrk-status" => "1"}, ["That's a good lad. Run along now and go home."]]) } # 410: the pending queue is drained, so there's no more work to hand out — go home even though an orphaned straggler (a.rb:2, no live worker) remains in processing. Previously this returned 404 and the worker spin-polled forever, starving the server.
     # Only the PASSED examples' run times are recorded (a.rb:1 and a.rb:3):
     # failures and pendings are not scheduling signal — a cascade of
@@ -46,6 +50,8 @@ RSpec.describe Specwrk::Web::Endpoints::CompleteAndPop do
     it { expect { subject }.to change { worker["passed"] }.from(nil).to(1) }
     it { expect { subject }.to change { worker["failed"] }.from(nil).to(1) }
     it { expect { subject }.to change { worker["pending"] }.from(nil).to(1) }
+    # No new bucket was handed out, so the worker has nothing in flight.
+    it { expect { subject }.to change { in_flight.reload[worker_id] }.to(nil) }
   end
 
   context "a retried completion whose first response was lost (same x-specwrk-request-id)" do
@@ -135,6 +141,12 @@ RSpec.describe Specwrk::Web::Endpoints::CompleteAndPop do
     it { is_expected.to eq([200, {"content-type" => "application/json", "x-specwrk-status" => "0"}, [JSON.generate([{id: "a.rb:2", file_path: "a.rb", expected_run_time: 0.1}])]]) }
     it { expect { subject }.to change { pending.reload.length }.from(1).to(0) }
     it { expect { subject }.to change { processing.reload["a.rb:2"] }.from(nil).to({expected_run_time: 0.1, file_path: "a.rb", id: "a.rb:2", worker_id: "foobar-0", processing_started_at: instance_of(Integer)}) }
+
+    it "replaces the worker's in-flight index entry with the new bucket" do
+      subject
+
+      expect(in_flight.reload[worker_id][:ids]).to eq(["a.rb:2"])
+    end
   end
 
   context "no items in the processing queue, but completed queue has items" do
@@ -150,6 +162,10 @@ RSpec.describe Specwrk::Web::Endpoints::CompleteAndPop do
       {"a.rb:2": {id: "a.rb:2", file_path: "a.rb", expected_run_time: 0.1, processing_started_at: (Time.now - 100).to_i, worker_id: other_worker_id}}
     end
 
+    let(:existing_in_flight_data) do
+      {other_worker_id => {ids: ["a.rb:2"], processing_started_at: (Time.now - 100).to_i}}
+    end
+
     before { other_worker.last_seen_at = Time.now - 19 }
 
     it { is_expected.to eq([404, {"content-type" => "text/plain", "x-specwrk-status" => "0"}, ["This is not the path you're looking for, 'ol chap..."]]) }
@@ -160,6 +176,10 @@ RSpec.describe Specwrk::Web::Endpoints::CompleteAndPop do
       {"a.rb:2": {id: "a.rb:2", file_path: "a.rb", expected_run_time: 0.1, processing_started_at: (Time.now - 100).to_i, worker_id: other_worker_id}}
     end
 
+    let(:existing_in_flight_data) do
+      {other_worker_id => {ids: ["a.rb:2"], processing_started_at: (Time.now - 100).to_i}}
+    end
+
     before { other_worker.last_seen_at = Time.now - 21 }
 
     it "requeues the expired example into a new pending bucket" do
@@ -168,6 +188,8 @@ RSpec.describe Specwrk::Web::Endpoints::CompleteAndPop do
       expect(response[0]).to eq(200)
       body_examples = JSON.parse(response[2].first, symbolize_names: true)
       expect(body_examples.map { |ex| ex[:id] }).to eq(["a.rb:2"])
+      expect(in_flight.reload[other_worker_id]).to be_nil
+      expect(in_flight[worker_id][:ids]).to eq(["a.rb:2"])
     end
   end
 

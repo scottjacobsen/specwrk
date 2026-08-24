@@ -14,6 +14,14 @@ RSpec.describe Specwrk::Web::Endpoints::Pop do
     it { is_expected.to eq([200, {"content-type" => "application/json", "x-specwrk-status" => "1"}, [JSON.generate([{id: "a.rb:2", file_path: "a.rb", expected_run_time: 0.1}])]]) }
     it { expect { subject }.to change { pending.reload.length }.from(1).to(0) }
     it { expect { subject }.to change { processing.reload["a.rb:2"] }.from(nil).to({expected_run_time: 0.1, file_path: "a.rb", id: "a.rb:2", worker_id: "foobar-0", processing_started_at: instance_of(Integer)}) }
+
+    it "records the worker's in-flight bucket in the index" do
+      subject
+
+      record = in_flight.reload[worker_id]
+      expect(record[:ids]).to eq(["a.rb:2"])
+      expect(record[:processing_started_at]).to be_within(5).of(Time.now.to_i)
+    end
   end
 
   context "no items in any queue" do
@@ -78,14 +86,37 @@ RSpec.describe Specwrk::Web::Endpoints::Pop do
       {"a.rb:2": {id: "a.rb:2", file_path: "a.rb", expected_run_time: 0.1, processing_started_at: (Time.now - 100).to_i, worker_id: other_worker_id}}
     end
 
+    let(:existing_in_flight_data) do
+      {other_worker_id => {ids: ["a.rb:2"], processing_started_at: (Time.now - 100).to_i}}
+    end
+
     before do
       other_worker.last_seen_at = Time.now - 21
       # Scan gate closed: the reclaim path is not due, so only the 410 guard
-      # stands between this bucket and every worker going home.
+      # stands between this bucket and every worker going home. The last scan
+      # cached a verdict that staleness became possible a moment ago.
       metadata[:last_expiry_check_at] = Time.now.to_i
+      metadata[:stale_in_flight_possible_at] = (Time.now - 1).to_i
     end
 
     it { is_expected.to eq([404, {"content-type" => "text/plain", "x-specwrk-status" => "0"}, ["This is not the path you're looking for, 'ol chap..."]]) }
+
+    it "answers from the cached verdict without reading the in-flight index or processing payloads" do
+      expect(instance).not_to receive(:in_flight)
+      expect_any_instance_of(Specwrk::ProcessingStore).not_to receive(:to_h)
+      expect_any_instance_of(Specwrk::ProcessingStore).not_to receive(:keys)
+      expect_any_instance_of(Specwrk::ProcessingStore).not_to receive(:multi_read)
+
+      expect(response[0]).to eq(404)
+    end
+
+    context "with no cached verdict at all" do
+      before { metadata.delete("stale_in_flight_possible_at") }
+
+      # Unknown means "assume reclaimable work": 404 keeps the pollers around
+      # for one scan interval, which writes the real verdict.
+      it { is_expected.to eq([404, {"content-type" => "text/plain", "x-specwrk-status" => "0"}, ["This is not the path you're looking for, 'ol chap..."]]) }
+    end
   end
 
   context "queue drained while a live worker still runs its final bucket" do
@@ -100,12 +131,32 @@ RSpec.describe Specwrk::Web::Endpoints::Pop do
       {"a.rb:2": {id: "a.rb:2", file_path: "a.rb", expected_run_time: 0.1, processing_started_at: (Time.now - 100).to_i, worker_id: other_worker_id}}
     end
 
+    let(:existing_in_flight_data) do
+      {other_worker_id => {ids: ["a.rb:2"], processing_started_at: (Time.now - 100).to_i}}
+    end
+
     before do
       other_worker.last_seen_at = Time.now - 5
+      # The last scan (gate closed) cached its verdict: the live owner's
+      # bucket can't turn stale for another 15s.
       metadata[:last_expiry_check_at] = Time.now.to_i
+      metadata[:stale_in_flight_possible_at] = (Time.now + 15).to_i
     end
 
     it { is_expected.to eq([410, {"content-type" => "text/plain", "x-specwrk-status" => "0"}, ["That's a good lad. Run along now and go home."]]) }
+
+    # This is THE hot path of a drained run: thousands of idle workers
+    # polling every 0.5s. Each empty pop must cost a couple of small reads —
+    # the cached verdict — never a walk of the in-flight index (per-worker
+    # heartbeat reads) or of the processing payloads (multi-MB).
+    it "answers from the cached verdict without reading the in-flight index or processing payloads" do
+      expect(instance).not_to receive(:in_flight)
+      expect_any_instance_of(Specwrk::ProcessingStore).not_to receive(:to_h)
+      expect_any_instance_of(Specwrk::ProcessingStore).not_to receive(:keys)
+      expect_any_instance_of(Specwrk::ProcessingStore).not_to receive(:multi_read)
+
+      expect(response[0]).to eq(410)
+    end
   end
 
   context "a retried pop whose first response was lost (same x-specwrk-request-id)" do
@@ -153,6 +204,10 @@ RSpec.describe Specwrk::Web::Endpoints::Pop do
       {"a.rb:2": {id: "a.rb:2", file_path: "a.rb", expected_run_time: 0.1, processing_started_at: (Time.now - 100).to_i, worker_id: other_worker_id}}
     end
 
+    let(:existing_in_flight_data) do
+      {other_worker_id => {ids: ["a.rb:2"], processing_started_at: (Time.now - 100).to_i}}
+    end
+
     before { other_worker.last_seen_at = Time.now - 5 }
 
     it { is_expected.to eq([404, {"content-type" => "text/plain", "x-specwrk-status" => "1"}, ["This is not the path you're looking for, 'ol chap..."]]) }
@@ -163,6 +218,10 @@ RSpec.describe Specwrk::Web::Endpoints::Pop do
   context "the expiry scan interval has not elapsed since the last scan" do
     let(:existing_processing_data) do
       {"a.rb:2": {id: "a.rb:2", file_path: "a.rb", expected_run_time: 0.1, processing_started_at: (Time.now - 100).to_i, worker_id: other_worker_id}}
+    end
+
+    let(:existing_in_flight_data) do
+      {other_worker_id => {ids: ["a.rb:2"], processing_started_at: (Time.now - 100).to_i}}
     end
 
     before do
@@ -182,6 +241,10 @@ RSpec.describe Specwrk::Web::Endpoints::Pop do
       {"a.rb:2": {id: "a.rb:2", file_path: "a.rb", expected_run_time: 0.1, processing_started_at: (Time.now - 100).to_i, worker_id: other_worker_id}}
     end
 
+    let(:existing_in_flight_data) do
+      {other_worker_id => {ids: ["a.rb:2"], processing_started_at: (Time.now - 100).to_i}}
+    end
+
     before { other_worker.last_seen_at = Time.now - 21 }
 
     # The requeued bucket is immediately handed back out in this same
@@ -196,11 +259,30 @@ RSpec.describe Specwrk::Web::Endpoints::Pop do
       expect(body_examples.map { |example| example[:id] }).to eq(["a.rb:2"])
       expect(metadata.reload[:last_expiry_check_at]).to be_within(5).of(Time.now.to_i)
     end
+
+    it "moves the in-flight index entry from the dead worker to the new owner" do
+      subject
+
+      expect(in_flight.reload[other_worker_id]).to be_nil
+      expect(in_flight[worker_id][:ids]).to eq(["a.rb:2"])
+    end
+
+    it "caches a staleness verdict for the empty pops between scans" do
+      subject
+
+      # The only record was stale and got requeued, so nothing left in
+      # flight can expire sooner than a fresh handout: now + expire_after.
+      expect(metadata.reload[:stale_in_flight_possible_at]).to be_within(5).of(Time.now.to_i + 20)
+    end
   end
 
   context "the expiry scan interval has elapsed with a stale prior scan timestamp" do
     let(:existing_processing_data) do
       {"a.rb:2": {id: "a.rb:2", file_path: "a.rb", expected_run_time: 0.1, processing_started_at: (Time.now - 100).to_i, worker_id: other_worker_id}}
+    end
+
+    let(:existing_in_flight_data) do
+      {other_worker_id => {ids: ["a.rb:2"], processing_started_at: (Time.now - 100).to_i}}
     end
 
     before do
@@ -218,6 +300,46 @@ RSpec.describe Specwrk::Web::Endpoints::Pop do
     end
   end
 
+  context "the reclaim scan reads payloads only for the stale workers' examples" do
+    # The scan used to materialize the ENTIRE processing store — full example
+    # payloads, multi-MB at tens of thousands of in-flight entries — while
+    # holding the per-run lock. It only ever needed (worker, started_at) per
+    # bucket to pick candidates, which the in-flight index provides; payloads
+    # are read just for the entries actually being requeued.
+    let(:third_worker_id) { "foobar-2" }
+    let(:third_worker) { Specwrk::WorkerStore.new datastore_uri, run_scope("workers", third_worker_id) }
+
+    let(:existing_processing_data) do
+      {
+        "a.rb:2": {id: "a.rb:2", file_path: "a.rb", expected_run_time: 0.1, processing_started_at: (Time.now - 100).to_i, worker_id: other_worker_id},
+        "b.rb:1": {id: "b.rb:1", file_path: "b.rb", expected_run_time: 0.1, processing_started_at: (Time.now - 100).to_i, worker_id: third_worker_id}
+      }
+    end
+
+    let(:existing_in_flight_data) do
+      {
+        other_worker_id => {ids: ["a.rb:2"], processing_started_at: (Time.now - 100).to_i},
+        third_worker_id => {ids: ["b.rb:1"], processing_started_at: (Time.now - 100).to_i}
+      }
+    end
+
+    before do
+      other_worker.last_seen_at = Time.now - 21 # dead
+      third_worker.last_seen_at = Time.now - 5 # alive, its bucket must stay put
+    end
+
+    it "never walks the full processing store and multi_reads only the dead worker's ids" do
+      expect_any_instance_of(Specwrk::ProcessingStore).not_to receive(:to_h)
+      expect_any_instance_of(Specwrk::ProcessingStore).not_to receive(:keys)
+      expect_any_instance_of(Specwrk::ProcessingStore).to receive(:multi_read).with("a.rb:2").and_call_original
+
+      expect(response[0]).to eq(200)
+      body_examples = JSON.parse(response[2].first, symbolize_names: true)
+      expect(body_examples.map { |example| example[:id] }).to eq(["a.rb:2"])
+      expect(processing.reload["b.rb:1"][:worker_id]).to eq(third_worker_id)
+    end
+  end
+
   context "requeues expired examples repacked into properly-sized pending buckets, not one giant tail bucket" do
     let(:env_vars) { super().merge("SPECWRK_SRV_GROUP_BY" => "file", "SPECWRK_SRV_BUCKET_RUN_TIME" => "10") }
 
@@ -225,6 +347,10 @@ RSpec.describe Specwrk::Web::Endpoints::Pop do
       (1..6).to_h do |n|
         [:"file#{n}.rb:1", {id: "file#{n}.rb:1", file_path: "file#{n}.rb", expected_run_time: 5.0, processing_started_at: (Time.now - 100).to_i, worker_id: other_worker_id}]
       end
+    end
+
+    let(:existing_in_flight_data) do
+      {other_worker_id => {ids: (1..6).map { |n| "file#{n}.rb:1" }, processing_started_at: (Time.now - 100).to_i}}
     end
 
     before { other_worker.last_seen_at = Time.now - 21 }
@@ -257,6 +383,10 @@ RSpec.describe Specwrk::Web::Endpoints::Pop do
       {"a.rb:2": {id: "a.rb:2", file_path: "a.rb", status: "passed", run_time: 0.1, started_at: Time.now.iso8601, finished_at: Time.now.iso8601}}
     end
 
+    let(:existing_in_flight_data) do
+      {other_worker_id => {ids: ["a.rb:2"], processing_started_at: (Time.now - 100).to_i}}
+    end
+
     before { other_worker.last_seen_at = Time.now - 21 }
 
     it "does not re-add the duplicate to pending, clears it from processing, and reports the queue drained" do
@@ -264,12 +394,55 @@ RSpec.describe Specwrk::Web::Endpoints::Pop do
 
       expect(response[0]).to eq(410)
       expect(processing.reload["a.rb:2"]).to be_nil
+      expect(in_flight.reload[other_worker_id]).to be_nil
+    end
+  end
+
+  context "a cached maybe-stale verdict flips back to the drain once the scan reclaims the dead worker's bucket" do
+    let(:existing_completed_data) do
+      {"a.rb:1": {id: "a.rb:1", file_path: "a.rb", expected_run_time: 0.1}}
+    end
+
+    let(:existing_processing_data) do
+      {"a.rb:2": {id: "a.rb:2", file_path: "a.rb", expected_run_time: 0.1, processing_started_at: (Time.now - 100).to_i, worker_id: other_worker_id}}
+    end
+
+    let(:existing_in_flight_data) do
+      {other_worker_id => {ids: ["a.rb:2"], processing_started_at: (Time.now - 100).to_i}}
+    end
+
+    before do
+      other_worker.last_seen_at = Time.now - 21
+      metadata[:last_expiry_check_at] = Time.now.to_i
+      metadata[:stale_in_flight_possible_at] = (Time.now - 1).to_i
+    end
+
+    def pop
+      described_class.new(Rack::Request.new(env.merge("rack.input" => StringIO.new(body)))).response
+    end
+
+    it "404s while the verdict holds, then hands the reclaimed bucket out and re-opens the drain" do
+      expect(pop[0]).to eq(404) # verdict: maybe stale, scan not due — keep polling
+
+      metadata[:last_expiry_check_at] = (Time.now - 60).to_i # the interval passes
+
+      reclaim_response = pop
+      expect(reclaim_response[0]).to eq(200)
+      body_examples = JSON.parse(reclaim_response[2].first, symbolize_names: true)
+      expect(body_examples.map { |example| example[:id] }).to eq(["a.rb:2"])
+
+      # The scan refreshed the verdict, so the next drained pop 410s home.
+      expect(metadata.reload[:stale_in_flight_possible_at]).to be > Time.now.to_i
     end
   end
 
   context "a second PendingStore instance writes a bucket while this endpoint's own pending is memoized stale" do
     let(:existing_processing_data) do
       {"a.rb:2": {id: "a.rb:2", file_path: "a.rb", expected_run_time: 0.1, processing_started_at: (Time.now - 100).to_i, worker_id: other_worker_id}}
+    end
+
+    let(:existing_in_flight_data) do
+      {other_worker_id => {ids: ["a.rb:2"], processing_started_at: (Time.now - 100).to_i}}
     end
 
     let(:interloper_example) { {"b.rb:1": {id: "b.rb:1", file_path: "b.rb"}} }

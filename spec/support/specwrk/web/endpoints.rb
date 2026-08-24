@@ -45,6 +45,7 @@ RSpec.shared_context "worker endpoint" do
   let(:worker) { Specwrk::WorkerStore.new datastore_uri, run_scope("workers", worker_id.to_s) }
   let(:other_worker) { Specwrk::WorkerStore.new datastore_uri, run_scope("workers", other_worker_id.to_s) }
   let(:failure_counts) { Specwrk::Store.new datastore_uri, run_scope("failure_counts") }
+  let(:in_flight) { Specwrk::Store.new datastore_uri, run_scope("in_flight") }
 
   let(:existing_run_times_data) { {} }
   let(:existing_pending_data) { {} }
@@ -52,6 +53,7 @@ RSpec.shared_context "worker endpoint" do
   let(:existing_completed_data) { {} }
   let(:existing_worker_data) { {} }
   let(:existing_failure_counts_data) { {} }
+  let(:existing_in_flight_data) { {} }
 
   let(:run_id) { "main" }
   let(:worker_id) { "foobar-0" }
@@ -71,5 +73,6 @@ RSpec.shared_context "worker endpoint" do
     completed.tap(&:clear).merge!(existing_completed_data)
     worker.tap(&:clear).merge!(existing_worker_data)
     failure_counts.tap(&:clear).merge!(existing_failure_counts_data)
+    in_flight.tap(&:clear).merge!(existing_in_flight_data)
   end
 end

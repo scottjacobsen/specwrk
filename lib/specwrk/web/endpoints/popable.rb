@@ -7,6 +7,7 @@ module Specwrk
     module Endpoints
       class Popable < Base
         LAST_EXPIRY_CHECK_AT_KEY = :last_expiry_check_at
+        STALE_IN_FLIGHT_POSSIBLE_AT_KEY = :stale_in_flight_possible_at
 
         private
 
@@ -95,14 +96,19 @@ module Specwrk
 
             bucket = pending.bucket_store_for(bucket_id)
             examples = bucket.examples
+            now = Time.now.to_i
 
             processing_data = examples.map do |example|
               [
-                example[:id], example.merge(worker_id: worker_id, processing_started_at: Time.now.to_i)
+                example[:id], example.merge(worker_id: worker_id, processing_started_at: now)
               ]
             end
 
             processing.merge!(processing_data.to_h)
+            # Index the handout by worker so the expiry scan can find reclaim
+            # candidates from worker-count-sized records instead of walking
+            # every processing payload.
+            in_flight[worker_id] = {ids: examples.map { |example| example[:id] }, processing_started_at: now}
             bucket.clear
 
             examples
@@ -112,10 +118,17 @@ module Specwrk
         # Reclaim examples whose owning worker has missed its heartbeats, requeuing
         # them onto pending. Gated by expiry_check_due? so an empty-pop stampede
         # (e.g. dozens of idle workers post-drain) doesn't each run a full scan of
-        # processing every request — at most one scan per
-        # SPECWRK_SRV_EXPIRY_CHECK_INTERVAL actually walks the set, and that scan
+        # the in-flight index every request — at most one scan per
+        # SPECWRK_SRV_EXPIRY_CHECK_INTERVAL actually walks it, and that scan
         # (plus the requeue) happens under the store lock so concurrent checkers
         # collapse into it rather than duplicating the work or the requeue.
+        #
+        # The scan works from the in-flight index (one small record per worker),
+        # never from the processing payloads: at tens of thousands of in-flight
+        # examples a full processing read is multi-MB, and doing that under the
+        # per-run lock let a degraded store push the scan toward the lock's
+        # deadman. Payloads are read only for the stale workers' examples — the
+        # ones actually being requeued, normally none.
         def reclaim_expired_examples
           @reclaim_expired_examples ||= if processing.empty? || !expiry_check_due?
             {}
@@ -125,16 +138,28 @@ module Specwrk
 
               metadata[LAST_EXPIRY_CHECK_AT_KEY] = Time.now.to_i
 
-              candidates = processing.reload.to_h.select { |_id, example| expired?(example) }
-              next {} if candidates.empty?
+              stale, live = in_flight.to_h.partition { |id, record| record_expired?(id.to_s, record) }.map(&:to_h)
 
-              candidate_keys = candidates.keys.map(&:to_s)
-              already_completed = completed.multi_read(*candidate_keys).keys
-              requeueable = candidates.reject { |id, _| already_completed.include?(id.to_s) }
+              # Cache the staleness verdict for the empty pops between scans,
+              # under the same lock as the requeue so the two can never
+              # disagree. Everything stale is requeued below, so only the live
+              # records bound when staleness next becomes possible.
+              metadata[STALE_IN_FLIGHT_POSSIBLE_AT_KEY] = stale_in_flight_possible_at(live)
+
+              next {} if stale.empty?
+
+              candidate_keys = stale.values.flat_map { |record| record[:ids] }.map(&:to_s)
+              candidates = candidate_keys.any? ? processing.multi_read(*candidate_keys) : {}
+              already_completed = candidates.any? ? completed.multi_read(*candidates.keys).keys : []
+              requeueable = candidates.except(*already_completed)
                 .transform_values { |example| example.except(:worker_id, :processing_started_at) }
 
               pending.reload.merge!(requeueable, prepend: true) if requeueable.any?
-              processing.delete(*candidate_keys) # completed stragglers cleared too
+              processing.delete(*candidate_keys) if candidate_keys.any? # completed stragglers cleared too
+              # Index entries go last: if we die mid-reclaim the next scan
+              # re-candidates these workers, finds their examples gone from
+              # processing, and just finishes the cleanup — no double-requeue.
+              in_flight.delete(*stale.keys.map(&:to_s))
 
               requeueable
             end
@@ -149,12 +174,44 @@ module Specwrk
         # work is (or is about to be) reclaimable, so the drained-queue 410 must
         # not send the remaining pollers home past it. Live owners don't count:
         # their buckets finish on their own and must not hold up the drain.
-        # Deliberately NOT gated by expiry_check_due? — this read-only check is
-        # what bridges the gap between two interval-gated reclaim scans.
+        #
+        # Answered from the verdict the reclaim scan caches, NOT by scanning
+        # anything: this runs on EVERY empty pop, and thousands of idle workers
+        # polling a draining run once made these scans saturate the store's
+        # bandwidth — slowing the very heartbeats whose absence they were
+        # looking for, falsely expiring workers fleet-wide. The cached verdict
+        # is safe to trust between scans: whenever this runs with work in
+        # flight, reclaim_expired_examples has either just scanned or found a
+        # scan under EXPIRY_CHECK_INTERVAL old, and no bucket can turn stale
+        # sooner than the cached horizon. A missing verdict means unknown —
+        # assume stale, hold the pollers, and let the next scan write one.
         def stale_in_flight_work?
           return false if processing.empty?
 
-          processing.reload.to_h.any? { |_id, example| expired?(example) }
+          Time.now.to_i >= (metadata[STALE_IN_FLIGHT_POSSIBLE_AT_KEY] || 0).to_i
+        end
+
+        # Earliest future moment in-flight work could first turn stale: each
+        # live record can't expire before max(handout, last heartbeat) +
+        # expire_after, and nothing handed out after this scan can expire
+        # before now + expire_after — which also caps the verdict, so it can
+        # never overshoot work this scan didn't see.
+        def stale_in_flight_possible_at(live_records)
+          horizon = Time.now.to_i + expire_after_seconds
+          earliest = live_records.map do |worker_id, record|
+            [record[:processing_started_at].to_i, workers_last_heartbeats[worker_id.to_s].to_i].max + expire_after_seconds
+          end.min
+
+          [earliest, horizon].compact.min
+        end
+
+        # Per-run worker_id -> {ids:, processing_started_at:} record of the
+        # bucket each worker currently holds, maintained on every handout and
+        # completion. Exists so staleness questions are answered from
+        # worker-count-sized records; the processing store's full payloads are
+        # only ever read for examples being requeued.
+        def in_flight
+          @in_flight ||= Store.new(ENV.fetch("SPECWRK_SRV_STORE_URI", "memory:///"), File.join(run_scope, "in_flight"), ttl: run_ttl)
         end
 
         # How often (seconds) the processing set is scanned for expired examples
@@ -163,13 +220,12 @@ module Specwrk
           @expiry_check_interval ||= ENV.fetch("SPECWRK_SRV_EXPIRY_CHECK_INTERVAL", "5").to_i
         end
 
-        # Has the worker missed two heartbeat check-ins?
-        def expired?(example)
-          return false unless example[:worker_id]
-          return false unless example[:processing_started_at]
-          return false unless example[:processing_started_at] < (Time.now - expire_after_seconds).to_i
+        # Has the record's worker missed two heartbeat check-ins?
+        def record_expired?(worker_id, record)
+          return false unless record[:processing_started_at]
+          return false unless record[:processing_started_at] < (Time.now - expire_after_seconds).to_i
 
-          workers_last_heartbeats[example[:worker_id]] < Time.now - expire_after_seconds
+          workers_last_heartbeats[worker_id] < Time.now - expire_after_seconds
         end
 
         # Seconds of missed heartbeats before a processing example is considered
