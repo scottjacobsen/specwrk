@@ -101,6 +101,13 @@ module Specwrk
     rescue Errno::ECONNRESET
       warn "\nServer at #{ENV.fetch("SPECWRK_SRV_URI", "http://localhost:5138")} stopped responding to connections, exiting..."
       1
+    rescue OpenSSL::SSL::SSLError => e
+      # The client retries a dead TLS keep-alive socket itself; one that stays
+      # dead past those retries lands here. Exit controlled rather than letting
+      # the raise crash the process (which loses the summary and reads as an
+      # unexplained node failure in CI).
+      warn "\nTLS connection to #{ENV.fetch("SPECWRK_SRV_URI", "http://localhost:5138")} failed (#{e.message}), exiting..."
+      1
     end
 
     # Boot the application once in this long-lived parent process so every

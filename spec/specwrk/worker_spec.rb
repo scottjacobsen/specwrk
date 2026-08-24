@@ -88,6 +88,24 @@ RSpec.describe Specwrk::Worker do
       end
     end
 
+    # Backstop for a TLS failure that outlives the client's own retries: exit
+    # with a controlled status 1 and a message instead of crashing the worker
+    # process on an unhandled OpenSSL::SSL::SSLError.
+    context "TLS session death persists past the client's retries" do
+      before do
+        allow(Specwrk::Client).to receive(:wait_for_server!)
+        allow(instance).to receive(:execute)
+          .and_raise(OpenSSL::SSL::SSLError.new("SSL_read: unexpected eof while reading"))
+      end
+
+      it "warns and exits with status 1" do
+        expect(instance).to receive(:warn)
+          .with(a_string_including("TLS connection"))
+
+        expect(subject).to eq(1)
+      end
+    end
+
     context "no examples processed" do
       before { allow(Specwrk::Client).to receive(:wait_for_server!) }
 

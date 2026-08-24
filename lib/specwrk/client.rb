@@ -33,7 +33,12 @@ module Specwrk
       http.finish
 
       true
-    rescue Errno::ECONNREFUSED, Errno::EHOSTUNREACH, OpenSSL::SSL::SSLError
+    rescue Errno::ECONNREFUSED, Errno::EHOSTUNREACH, OpenSSL::SSL::SSLError,
+      Net::OpenTimeout, IO::TimeoutError
+      # A connect timeout is the same answer as a refused connection: not up
+      # yet. wait_for_server! polls this in a loop, and letting the timeout
+      # raise crashed whole workers during the boot herd (thousands of
+      # simultaneous TLS handshakes against one load balancer).
       false
     end
 
@@ -70,11 +75,13 @@ module Specwrk
     # response code, duration). On for a worker's data client so CI output
     # shows exactly when the server was called and what it cost; off for the
     # heartbeat client, which would otherwise add a line every ~10s.
+    # The connection is NOT opened here: an eager connect made a TCP timeout
+    # (IO::TimeoutError) at construction crash the worker before
+    # wait_for_server! ever ran. make_request opens it lazily on first use.
     def initialize(log_requests: false)
       @log_requests = log_requests
       @mutex = Mutex.new
       @http = self.class.build_http
-      @http.start
       @worker_status = 1
       # Per-instance, keyed by request path ("/pop" etc — paths ARE the
       # endpoint names). make_request already holds @mutex for the whole
@@ -83,7 +90,7 @@ module Specwrk
     end
 
     def close
-      @mutex.synchronize { @http.finish }
+      @mutex.synchronize { @http.finish if @http.started? }
     end
 
     # For long idle gaps the caller knows about (e.g. a minutes-long app
@@ -223,6 +230,10 @@ module Specwrk
         # of the block, so each attempt gets its own start time.
         attempt_started_at = Process.clock_gettime(Process::CLOCK_MONOTONIC)
         @last_request_at = Time.now
+        # Explicit rather than letting Net::HTTP#request auto-start, which
+        # uses the block form and closes the socket again after one request —
+        # silently disabling keep-alive.
+        @http.start unless @http.started?
         @http.request(request).tap do |response|
           @retry_count = 0
           record_attempt(request.path, attempt_started_at)
@@ -230,21 +241,25 @@ module Specwrk
 
           @worker_status = response["x-specwrk-status"].to_i if response["x-specwrk-status"]
         end
-      rescue Net::ReadTimeout, Net::WriteTimeout => e
+      rescue Net::ReadTimeout, Net::WriteTimeout, Net::OpenTimeout, IO::TimeoutError => e
+        # The open-timeout pair comes from the lazy @http.start above; no
+        # reconnect needed — the next attempt just opens again.
         # `ensure` does not run on `retry`, so record explicitly here rather
         # than relying on an ensure to cover every attempt.
         record_attempt(request.path, attempt_started_at)
         log_attempt(request, e.class, attempt_started_at)
         retry_or_raise!(e)
         retry
-      rescue Errno::ECONNRESET, Errno::EPIPE, IOError => e
+      rescue Errno::ECONNRESET, Errno::EPIPE, IOError, OpenSSL::SSL::SSLError => e
         # A keep-alive connection Puma (or another server-side idle timeout)
         # closed while this client held it open goes undetected until the next
         # request tries to reuse it: Net::HTTP only auto-retries idempotent
         # methods on a dead keep-alive socket, so a POST surfaces one of these
         # (IOError covers EOFError, a subclass) instead of a clean refusal.
-        # Reconnect before retrying so the retry isn't doomed to hit the same
-        # dead socket again.
+        # On TLS the same death arrives as OpenSSL::SSL::SSLError ("SSL_read:
+        # unexpected eof while reading") — not an IOError subclass, so it must
+        # be rescued by name. Reconnect before retrying so the retry isn't
+        # doomed to hit the same dead socket again.
         record_attempt(request.path, attempt_started_at)
         log_attempt(request, e.class, attempt_started_at)
         retry_or_raise!(e)

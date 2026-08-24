@@ -66,6 +66,22 @@ RSpec.describe Specwrk::Client do
 
       it { is_expected.to be false }
     end
+
+    context "when the TCP connect times out (Net::HTTP's own deadline)" do
+      before do
+        allow_any_instance_of(Net::HTTP).to receive(:start).and_raise(Net::OpenTimeout)
+      end
+
+      it { is_expected.to be false }
+    end
+
+    context "when the TCP connect times out (raw IO::TimeoutError from TCPSocket)" do
+      before do
+        allow_any_instance_of(Net::HTTP).to receive(:start).and_raise(IO::TimeoutError)
+      end
+
+      it { is_expected.to be false }
+    end
   end
 
   describe ".build_http" do
@@ -269,6 +285,46 @@ RSpec.describe Specwrk::Client do
       client.reconnect
 
       expect(client.fetch_examples).to eq([])
+    end
+  end
+
+  # The connection used to open eagerly in #initialize, which meant a TCP
+  # connect timeout (IO::TimeoutError) crashed the worker at boot — before
+  # wait_for_server! ever ran. Opening lazily on the first request puts
+  # wait_for_server!'s patient polling in front of the first real connect.
+  describe "lazy connection" do
+    it "does not open a connection at construction" do
+      expect_any_instance_of(Net::HTTP).not_to receive(:start)
+
+      described_class.new
+    end
+
+    it "survives a connect timeout at construction time" do
+      allow_any_instance_of(Net::HTTP).to receive(:start).and_raise(IO::TimeoutError)
+
+      expect { described_class.new }.not_to raise_error
+    end
+
+    it "retries a connect timeout on first use, then succeeds" do
+      stub_request(:post, "#{base_uri}/pop")
+        .with(headers: headers)
+        .to_return(status: 200, body: "[]")
+
+      client = described_class.new
+      http = client.send(:instance_variable_get, :@http)
+      allow(http).to receive(:start).and_invoke(
+        proc { raise IO::TimeoutError },
+        proc { true }
+      )
+
+      expect(client).to receive(:warn).once
+      expect(client).to receive(:sleep).once
+
+      expect(client.fetch_examples).to eq([])
+    end
+
+    it "close is a no-op on a client that never connected" do
+      expect { described_class.new.close }.not_to raise_error
     end
   end
 
@@ -505,8 +561,9 @@ RSpec.describe Specwrk::Client do
 
         expect(client).to receive(:warn).once
         expect(client).to receive(:sleep).once
+        expect(http).to receive(:start).ordered.and_call_original # the lazy first open
         expect(http).to receive(:finish).ordered.and_call_original
-        expect(http).to receive(:start).ordered.and_call_original
+        expect(http).to receive(:start).ordered.and_call_original # the reconnect
 
         expect(subject).to eq(examples)
         expect(client.retry_count).to eq(0)
@@ -526,9 +583,53 @@ RSpec.describe Specwrk::Client do
         expect(client).to receive(:warn).exactly(5).times
         expect(client).to receive(:sleep).exactly(5).times
         expect(http).to receive(:finish).exactly(5).times.and_call_original
-        expect(http).to receive(:start).exactly(5).times.and_call_original
+        expect(http).to receive(:start).exactly(6).times.and_call_original # lazy first open + 5 reconnects
 
         expect { subject }.to raise_error(EOFError)
+      end
+    end
+
+    # A TLS keep-alive socket torn down server-side (queue server or its load
+    # balancer dropping connections under load) surfaces as
+    # OpenSSL::SSL::SSLError "SSL_read: unexpected eof while reading" on the
+    # next request — NOT as EOFError/IOError, so the dead-keep-alive rescue
+    # above never caught it and the error crashed whole workers mid-run.
+    context "when the TLS session dies mid-request once, then succeeds" do
+      let(:examples) { [{id: 4, name: "tls-recovered example"}] }
+
+      before do
+        stub_request(:post, "#{base_uri}/complete_and_pop")
+          .with(headers: headers)
+          .to_raise(OpenSSL::SSL::SSLError.new("SSL_read: unexpected eof while reading")).then
+          .to_return(status: 200, body: examples.to_json)
+      end
+
+      it "reconnects (finish then start) before retrying and returns the parsed body" do
+        http = client.send(:instance_variable_get, :@http)
+
+        expect(client).to receive(:warn).once
+        expect(client).to receive(:sleep).once
+        expect(http).to receive(:start).ordered.and_call_original # the lazy first open
+        expect(http).to receive(:finish).ordered.and_call_original
+        expect(http).to receive(:start).ordered.and_call_original # the reconnect
+
+        expect(subject).to eq(examples)
+        expect(client.retry_count).to eq(0)
+      end
+    end
+
+    context "when the TLS session keeps dying across every retry" do
+      before do
+        stub_request(:post, "#{base_uri}/complete_and_pop")
+          .with(headers: headers)
+          .to_raise(OpenSSL::SSL::SSLError.new("SSL_read: unexpected eof while reading"))
+      end
+
+      it "reconnects and warns each time, then re-raises once retries are exhausted" do
+        expect(client).to receive(:warn).exactly(5).times
+        expect(client).to receive(:sleep).exactly(5).times
+
+        expect { subject }.to raise_error(OpenSSL::SSL::SSLError)
       end
     end
   end
