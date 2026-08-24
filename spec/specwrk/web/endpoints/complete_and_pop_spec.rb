@@ -46,8 +46,11 @@ RSpec.describe Specwrk::Web::Endpoints::CompleteAndPop do
       expect(run_times["a.rb:5"]).to be_nil # failed
     end
     it { expect { subject }.to change { processing.reload.length }.from(4).to(1) }
-    it { expect { subject }.to change { completed.reload.length }.from(0).to(3) }
-    it { expect { subject }.to change { worker["passed"] }.from(nil).to(1) }
+    # All four payload results complete — including a.rb:3, whose processing
+    # entry is gone (a reclaimed-then-reported late result, merged rather
+    # than discarded).
+    it { expect { subject }.to change { completed.reload.length }.from(0).to(4) }
+    it { expect { subject }.to change { worker["passed"] }.from(nil).to(2) }
     it { expect { subject }.to change { worker["failed"] }.from(nil).to(1) }
     it { expect { subject }.to change { worker["pending"] }.from(nil).to(1) }
     # No new bucket was handed out, so the worker has nothing in flight.
@@ -134,6 +137,12 @@ RSpec.describe Specwrk::Web::Endpoints::CompleteAndPop do
   end
 
   context "successfully pops an item off the queue" do
+    # An empty completion: these contexts pin the POP half of the endpoint.
+    # (The default 4-result body used to be silently discarded here — its ids
+    # were not in processing — but late results now merge, which would drag
+    # completion side effects into these pop-shape assertions.)
+    let(:body) { JSON.generate([]) }
+
     let(:existing_pending_data) do
       {"a.rb:2": {id: "a.rb:2", file_path: "a.rb", expected_run_time: 0.1}}
     end
@@ -150,6 +159,8 @@ RSpec.describe Specwrk::Web::Endpoints::CompleteAndPop do
   end
 
   context "no items in the processing queue, but completed queue has items" do
+    let(:body) { JSON.generate([]) } # see "successfully pops an item off the queue"
+
     let(:existing_completed_data) do
       {"a.rb:2": {id: "a.rb:2", file_path: "a.rb", expected_run_time: 0.1}}
     end
@@ -158,6 +169,8 @@ RSpec.describe Specwrk::Web::Endpoints::CompleteAndPop do
   end
 
   context "no items in the pending queue, but something in the processing queue but none are expired" do
+    let(:body) { JSON.generate([]) } # see "successfully pops an item off the queue"
+
     let(:existing_processing_data) do
       {"a.rb:2": {id: "a.rb:2", file_path: "a.rb", expected_run_time: 0.1, processing_started_at: (Time.now - 100).to_i, worker_id: other_worker_id}}
     end
@@ -315,6 +328,155 @@ RSpec.describe Specwrk::Web::Endpoints::CompleteAndPop do
       expect(completed.reload.length).to eq(1)
       expect(completed["a.rb:1"][:status]).to eq("failed")
       expect(worker.reload["failed"]).to eq(1)
+    end
+  end
+
+  # Duplicate executions of the same example — a falsely-expired bucket
+  # reclaimed and re-run while its original owner was still alive, or a
+  # payload carrying two attempts — must converge on the passing outcome.
+  # These pin that convergence WITHOUT masking genuine failures: an example
+  # that never passed anywhere still reds (see "a retry-exhausted failure is
+  # red exactly once" above).
+  context "a duplicate execution's failure arrives after the example already completed as passed" do
+    let(:existing_completed_data) do
+      {"a.rb:1": {id: "a.rb:1", file_path: "a.rb", run_time: 0.1, status: "passed", worker_id: other_worker_id}}
+    end
+
+    let(:existing_processing_data) do
+      {"a.rb:1": {id: "a.rb:1", file_path: "a.rb", expected_run_time: 0.1}}
+    end
+
+    let(:body) do
+      JSON.generate([{id: "a.rb:1", file_path: "a.rb", run_time: 0.1, status: "failed"}])
+    end
+
+    it "keeps the pass, releases the processing entry, and does not mark this worker failed" do
+      subject
+
+      expect(completed.reload["a.rb:1"][:status]).to eq("passed")
+      expect(processing.reload).to be_empty
+      expect(worker.reload["failed"]).to eq(0)
+      expect(response[1]["x-specwrk-status"]).to eq("0")
+    end
+  end
+
+  context "a duplicate execution's pass supersedes an earlier completed failure" do
+    let(:existing_completed_data) do
+      {"a.rb:1": {id: "a.rb:1", file_path: "a.rb", run_time: 0.1, status: "failed", worker_id: other_worker_id}}
+    end
+
+    let(:existing_worker_data) { {} }
+
+    let(:existing_processing_data) do
+      {"a.rb:1": {id: "a.rb:1", file_path: "a.rb", expected_run_time: 0.1}}
+    end
+
+    let(:body) do
+      JSON.generate([{id: "a.rb:1", file_path: "a.rb", run_time: 0.1, status: "passed"}])
+    end
+
+    before { other_worker.merge!(passed: 3, failed: 1, pending: 0) }
+
+    it "overwrites the failure and releases it from the failing worker's tally" do
+      subject
+
+      expect(completed.reload["a.rb:1"][:status]).to eq("passed")
+      expect(worker.reload["passed"]).to eq(1)
+      expect(other_worker.reload["failed"]).to eq(0)
+      expect(response[1]["x-specwrk-status"]).to eq("0")
+    end
+  end
+
+  context "one payload carries a failed and a passed attempt of the same example" do
+    let(:existing_processing_data) do
+      {"a.rb:1": {id: "a.rb:1", file_path: "a.rb", expected_run_time: 0.1}}
+    end
+
+    # Worst-case order: the failed record comes LAST, so plain last-write-wins
+    # dedup would complete the example as failed even though it passed.
+    let(:body) do
+      JSON.generate([
+        {id: "a.rb:1", file_path: "a.rb", run_time: 0.1, status: "passed"},
+        {id: "a.rb:1", file_path: "a.rb", run_time: 0.1, status: "failed"}
+      ])
+    end
+
+    it "completes the example as passed and does not mark the worker failed" do
+      subject
+
+      expect(completed.reload["a.rb:1"][:status]).to eq("passed")
+      expect(worker.reload["failed"]).to eq(0)
+      expect(response[1]["x-specwrk-status"]).to eq("0")
+    end
+  end
+
+  # A falsely-expired bucket's original owner reporting after the reclaim:
+  # its processing entries are gone (requeued into pending, or completed by
+  # the worker that stole the bucket). The work really ran — merge the
+  # results under the same pass-beats-fail rule instead of discarding them.
+  # The request-id replay layer above still guards duplicate requests.
+  context "late results whose processing entries were already reclaimed" do
+    let(:existing_processing_data) { {} }
+
+    let(:body) do
+      JSON.generate([
+        {id: "a.rb:1", file_path: "a.rb", run_time: 0.1, started_at: Time.now.iso8601, finished_at: Time.now.iso8601, status: "passed"},
+        {id: "a.rb:2", file_path: "a.rb", run_time: 0.1, started_at: Time.now.iso8601, finished_at: Time.now.iso8601, status: "failed"}
+      ])
+    end
+
+    it "merges the results and tallies them for this worker" do
+      subject
+
+      expect(completed.reload["a.rb:1"][:status]).to eq("passed")
+      expect(completed["a.rb:2"][:status]).to eq("failed")
+      expect(worker.reload["passed"]).to eq(1)
+      expect(worker["failed"]).to eq(1)
+      expect(response[1]["x-specwrk-status"]).to eq("1")
+    end
+  end
+
+  context "a late pass arrives after the stolen re-run already completed the example as failed" do
+    let(:existing_processing_data) { {} }
+
+    let(:existing_completed_data) do
+      {"a.rb:1": {id: "a.rb:1", file_path: "a.rb", run_time: 0.1, status: "failed", worker_id: other_worker_id}}
+    end
+
+    let(:body) do
+      JSON.generate([{id: "a.rb:1", file_path: "a.rb", run_time: 0.1, status: "passed"}])
+    end
+
+    before { other_worker.merge!(passed: 0, failed: 1, pending: 0) }
+
+    it "supersedes the failure and releases it from the other worker's tally" do
+      subject
+
+      expect(completed.reload["a.rb:1"][:status]).to eq("passed")
+      expect(other_worker.reload["failed"]).to eq(0)
+      expect(response[1]["x-specwrk-status"]).to eq("0")
+    end
+  end
+
+  # A late FAILED result must not be requeued through the retry path: the
+  # reclaim that erased its processing entry already requeued the example
+  # (or someone completed it), so a retry here would duplicate the pending
+  # entry. It goes straight to completed under pass-beats-fail instead.
+  context "a late failure with retries remaining" do
+    let(:existing_processing_data) { {} }
+    let(:existing_failure_counts_data) { {} }
+
+    let(:body) do
+      JSON.generate([{id: "a.rb:1", file_path: "a.rb", run_time: 0.1, status: "failed"}])
+    end
+
+    before { pending.max_retries = 5 }
+
+    it "is completed, not requeued" do
+      subject
+
+      expect(pending.reload.length).to eq(0)
+      expect(completed.reload["a.rb:1"][:status]).to eq("failed")
     end
   end
 

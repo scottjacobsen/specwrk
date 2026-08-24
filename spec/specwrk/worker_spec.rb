@@ -336,6 +336,83 @@ RSpec.describe Specwrk::Worker do
     end
   end
 
+  # A worker with broken node-local infrastructure (e.g. a dead ClickHouse)
+  # insta-fails every bucket it touches and vacuums the queue, terminally
+  # failing healthy examples fleet-wide. The signature is unmistakable —
+  # consecutive buckets where EVERY example failed in near-zero run time —
+  # and distinct from a legitimately failing bucket, whose examples take
+  # real time (or don't all fail).
+  describe "poisoned-node circuit breaker" do
+    let(:poisoned_results) do
+      [
+        {id: "a.rb:1", status: "failed", run_time: 0.001},
+        {id: "a.rb:2", status: "failed", run_time: nil} # synthesized results count as instant
+      ]
+    end
+
+    let(:healthy_results) do
+      [
+        {id: "a.rb:1", status: "passed", run_time: 0.5},
+        {id: "a.rb:2", status: "failed", run_time: 0.2}
+      ]
+    end
+
+    let(:slow_failed_results) do
+      [
+        {id: "a.rb:1", status: "failed", run_time: 1.2},
+        {id: "a.rb:2", status: "failed", run_time: 0.8}
+      ]
+    end
+
+    before { allow(instance).to receive(:log_ts) }
+
+    it "raises after the configured number of consecutive poisoned buckets, withholding the final bucket's results" do
+      allow(instance).to receive(:run_in_fork).and_return(poisoned_results)
+
+      expect(instance).to receive(:complete_examples).with(poisoned_results).twice
+
+      instance.execute
+      instance.execute
+      expect { instance.execute }.to raise_error(Specwrk::PoisonedWorkerError)
+    end
+
+    it "resets the streak when a bucket has any non-instant or non-failed outcome" do
+      allow(instance).to receive(:complete_examples)
+      allow(instance).to receive(:run_in_fork)
+        .and_return(poisoned_results, poisoned_results, healthy_results, poisoned_results, poisoned_results)
+
+      expect { 5.times { instance.execute } }.not_to raise_error
+    end
+
+    it "does not count legitimately-failing buckets whose examples took real time" do
+      allow(instance).to receive(:complete_examples)
+      allow(instance).to receive(:run_in_fork).and_return(slow_failed_results)
+
+      expect { 5.times { instance.execute } }.not_to raise_error
+    end
+
+    it "is disabled when SPECWRK_POISON_BUCKETS is 0" do
+      allow(instance).to receive(:poison_bucket_max).and_return(0)
+      allow(instance).to receive(:complete_examples)
+      allow(instance).to receive(:run_in_fork).and_return(poisoned_results)
+
+      expect { 5.times { instance.execute } }.not_to raise_error
+    end
+
+    it "defaults to 3 consecutive buckets under a 0.1s average run time" do
+      expect(instance.send(:poison_bucket_max)).to eq(3)
+      expect(instance.send(:poison_avg_seconds)).to eq(0.1)
+    end
+
+    it "exits red even if the server-informed status is green" do
+      allow(Specwrk::Client).to receive(:wait_for_server!)
+      allow(client).to receive(:worker_status).and_return(0)
+      allow(instance).to receive(:execute).and_raise(Specwrk::PoisonedWorkerError)
+
+      expect(instance.run).to eq(1)
+    end
+  end
+
   describe "#rspec_command" do
     before { allow(instance).to receive(:rspec_seed_options).and_return("") }
 

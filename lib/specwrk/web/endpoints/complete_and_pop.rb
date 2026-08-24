@@ -11,6 +11,10 @@ module Specwrk
         def with_response
           idempotent do
             retry_examples # pre-calculate before lock
+            # Snapshot what the completed store held BEFORE this payload's
+            # merge: reconciliation and tallies below must compare against the
+            # prior state, not read back their own writes.
+            previously_completed
 
             with_lock do
               pending.reload
@@ -22,7 +26,8 @@ module Specwrk
               pending.merge!(retry_examples)
             end
 
-            completed.merge!(completed_examples)
+            completed.merge!(mergeable_completed_examples)
+            release_superseded_failures
             failure_counts.merge!(retry_examples_new_failure_counts)
 
             update_run_times
@@ -33,8 +38,24 @@ module Specwrk
 
         private
 
+        # Deduplicated by id with pass-beats-fail semantics: when one payload
+        # carries several attempts of the same example (duplicate executions),
+        # a failed record never displaces a non-failed one — otherwise the
+        # last record would win regardless of order and a flake's failing
+        # attempt could complete an example that actually passed.
+        #
+        # Results whose processing entries are GONE are accepted too: they're
+        # a falsely-expired bucket's original owner reporting after the
+        # reclaim erased its entries. That work really ran — discarding it
+        # threw away real outcomes. The request-id replay layer still guards
+        # duplicate requests.
         def all_examples
-          @all_examples ||= payload.map { |example| [example[:id], example] if processing_examples[example[:id]] }.compact.to_h
+          @all_examples ||= payload.each_with_object({}) do |example, examples|
+            already_seen = examples[example[:id]]
+            next if already_seen && example[:status] == "failed" && already_seen[:status] != "failed"
+
+            examples[example[:id]] = example
+          end
         end
 
         def processing_examples
@@ -65,6 +86,16 @@ module Specwrk
 
         def retry_example?(example)
           return false unless example[:status] == "failed"
+          # A late result whose processing entry is gone: the reclaim that
+          # erased it already requeued the example (or someone completed it),
+          # so a retry here would duplicate the pending entry. It completes
+          # under pass-beats-fail instead.
+          return false unless processing_examples[example[:id]]
+          # A duplicate execution of an example that already completed as
+          # passed: there is nothing to retry, and requeuing it would run a
+          # green example yet again. It falls through to completed_examples,
+          # where mergeable_completed_examples drops it.
+          return false if previously_completed.dig(example[:id], :status) == "passed"
           return false unless pending.max_retries.positive?
 
           example_failure_count = all_example_failure_counts.fetch(example[:id], 0)
@@ -72,12 +103,55 @@ module Specwrk
           example_failure_count < pending.max_retries
         end
 
+        # What the completed store already holds for this payload's ids — the
+        # basis for reconciling duplicate executions of the same example.
+        def previously_completed
+          @previously_completed ||= all_examples.any? ? completed.multi_read(*all_examples.keys) : {}
+        end
+
+        # Pass-beats-fail against the completed store: a failed record must
+        # never overwrite a pass another execution already recorded, while a
+        # pass may overwrite an earlier failure (release_superseded_failures
+        # then credits that back). Records are stamped with the reporting
+        # worker so a later pass knows whose tally held the failure.
+        def mergeable_completed_examples
+          @mergeable_completed_examples ||= completed_examples.reject { |id, example|
+            example[:status] == "failed" && previously_completed.dig(id, :status) == "passed"
+          }.transform_values { |example| example.merge(worker_id: worker_id) }
+        end
+
+        # A pass landing over an earlier completed failure removes that
+        # failure from the tally of the worker that reported it, so an
+        # already-superseded flake can't red the node that saw it fail first.
+        # Failures recorded before worker stamping existed have no worker_id
+        # and are left alone.
+        def release_superseded_failures
+          superseded_by_worker = mergeable_completed_examples.filter_map { |id, example|
+            next if example[:status] == "failed"
+
+            previous = previously_completed[id]
+            previous[:worker_id] if previous && previous[:status] == "failed"
+          }.tally
+
+          superseded_by_worker.each do |id, count|
+            next if id.nil?
+
+            store = (id.to_s == worker_id) ? worker : worker_store_for(id.to_s)
+            store.merge!(failed: [store[:failed].to_i - count, 0].max)
+          end
+        end
+
         def all_example_failure_counts
           @all_example_failure_counts ||= failure_counts.multi_read(*all_examples.keys)
         end
 
+        # Tally only records that actually landed and changed the recorded
+        # outcome: a dropped failed-over-passed duplicate must not red this
+        # worker, and a same-status duplicate must not inflate its counts.
         def completed_examples_status_counts
-          @completed_examples_status_counts ||= completed_examples.values.map { |example| example[:status] }.tally
+          @completed_examples_status_counts ||= mergeable_completed_examples
+            .reject { |id, example| previously_completed.dig(id, :status) == example[:status] }
+            .values.map { |example| example[:status] }.tally
         end
 
         def update_run_times

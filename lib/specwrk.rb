@@ -12,6 +12,10 @@ module Specwrk
   NoMoreExamplesError = Class.new(ClientError)
   CompletedAllExamplesError = Class.new(ClientError)
 
+  # Raised by a worker whose consecutive buckets all failed in near-zero time
+  # -- the signature of broken node-local infrastructure, not failing specs.
+  PoisonedWorkerError = Class.new(Error)
+
   @force_quit = false
   @starting_pid = Process.pid
 

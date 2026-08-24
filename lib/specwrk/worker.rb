@@ -79,6 +79,13 @@ module Specwrk
           warn "No examples seeded, giving up!"
           break
         end
+      rescue PoisonedWorkerError
+        # register_poison! tripped: this node is failing everything instantly
+        # (broken node-local infrastructure). Stop popping so it can't vacuum
+        # the queue; the withheld bucket is reclaimed for a healthy worker
+        # once our heartbeats stop.
+        @poisoned = true
+        break
       end
 
       @heartbeat_thread.kill
@@ -148,6 +155,7 @@ module Specwrk
       @metrics[:examples] += results.length
       @metrics[:example_time] += results.sum { |result| result[:run_time].to_f } # nil.to_f == 0 handles synthesized results
       log_bucket_done(bucket, results, bucket_wall)
+      register_poison! results
       complete_examples results
     rescue UnhandledResponseError => e
       # If fetching examples via next_examples fails we can just try again so warn and return
@@ -352,6 +360,52 @@ module Specwrk
       @no_work_max ||= ENV.fetch("SPECWRK_NO_WORK_WAITS", "120").to_i
     end
 
+    # Circuit breaker for a poisoned node: broken node-local infrastructure
+    # (e.g. a dead ClickHouse) insta-fails every bucket and vacuums the queue,
+    # terminally failing healthy examples fleet-wide. The signature — every
+    # example in the bucket failed, in near-zero run time, N buckets in a row
+    # — is distinct from a legitimately failing bucket, whose examples either
+    # take real time or don't all fail. On the Nth consecutive hit the
+    # tripping bucket's results are withheld (the raise skips
+    # complete_examples) so the server's heartbeat expiry requeues them for a
+    # healthy worker; the N-1 earlier buckets were already reported. The
+    # worker then exits red via #status.
+    def register_poison!(results)
+      return if poison_bucket_max.zero?
+
+      unless poisoned_bucket?(results)
+        @poisoned_buckets = 0
+        return
+      end
+
+      @poisoned_buckets = (@poisoned_buckets || 0) + 1
+      return if @poisoned_buckets < poison_bucket_max
+
+      log_ts "poison circuit breaker: #{@poisoned_buckets} consecutive instant total-failure buckets — " \
+        "withholding this bucket's results for reclaim and exiting"
+      raise PoisonedWorkerError
+    end
+
+    def poisoned_bucket?(results)
+      return false if results.empty?
+      return false unless results.all? { |result| result[:status].to_s == "failed" }
+
+      average_run_time = results.sum { |result| result[:run_time].to_f } / results.length
+      average_run_time < poison_avg_seconds
+    end
+
+    # Consecutive instant total-failure buckets before the breaker trips.
+    # 0 disables. Override with SPECWRK_POISON_BUCKETS.
+    def poison_bucket_max
+      @poison_bucket_max ||= ENV.fetch("SPECWRK_POISON_BUCKETS", "3").to_i
+    end
+
+    # A bucket only counts as poisoned when its average per-example run time
+    # is under this many seconds. Override with SPECWRK_POISON_AVG_SECONDS.
+    def poison_avg_seconds
+      @poison_avg_seconds ||= ENV.fetch("SPECWRK_POISON_AVG_SECONDS", "0.1").to_f
+    end
+
     # Max seconds to wait for a single bucket's child before killing it as hung.
     # Well above any legit bucket (buckets target ~10s of run time) and below CI's
     # ~10m no-output timeout, so a wedged example fails its bucket instead of
@@ -464,6 +518,9 @@ module Specwrk
     end
 
     def status
+      # A poisoned node is sick by definition — never exit green, even if its
+      # completed failures were all superseded by healthy re-runs by now.
+      return client.worker_status.clamp(1, 255) if @poisoned
       return 0 if @all_examples_completed && client.worker_status.zero?
       return 1 if Specwrk.force_quit
 
