@@ -43,15 +43,10 @@ module Specwrk
     end
 
     # Total examples still queued, summed from every bucket's stored count in
-    # ONE batched read — never the example payloads themselves. A read per
-    # bucket was a round trip per bucket against a networked store, and this
-    # is on the metrics scrape path: a large suite's thousands of buckets made
-    # a single scrape cost tens of seconds.
-    #
-    # A bucket missing the count field contributes nothing. The field is
-    # written with the payload, so the only way to miss it is a bucket already
-    # popped and deleted since bucket_ids was read — which is genuinely no
-    # longer queued.
+    # ONE batched read — this is on the metrics scrape path, and a round trip
+    # per bucket against a networked store cost tens of seconds. A bucket
+    # missing the count field was popped and deleted since bucket_ids was
+    # read — genuinely no longer queued — and contributes nothing.
     def example_count
       return 0 if bucket_ids.empty?
 
@@ -61,11 +56,10 @@ module Specwrk
       counts.sum { |_bucket_scope, fields| fields[count_key].to_i }
     end
 
-    # Every bucket goes out in one batch rather than one write per bucket:
-    # a seed of a large suite groups into thousands of buckets, and against a
-    # networked store that was thousands of sequential round trips blocking
-    # the whole fleet. The bucket ids are still written once, after the
-    # payloads land, so a reader never sees an id whose bucket is missing.
+    # Every bucket goes out in one batch — thousands of sequential round
+    # trips blocked the whole fleet on a networked store. Bucket ids are
+    # written once, after the payloads land, so a reader never sees an id
+    # whose bucket is missing.
     def merge!(hash, prepend: false)
       return self if hash.nil? || hash.empty?
 
@@ -163,28 +157,18 @@ module Specwrk
       buckets
     end
 
-    # Pack whole spec files into buckets, slowest file first, up to a target total
-    # run time per bucket (SPECWRK_SRV_BUCKET_RUN_TIME seconds). A file's examples
-    # are never split across buckets — so a worker still loads each file at most
-    # once (required by suites that redefine constants at file load, e.g. under
-    # DeprecationToolkit) — while batching multiple files per bucket cuts the
-    # per-file round trips to the server and dispatches the slowest files first to
-    # avoid stragglers. Files without timing data sort first (treated as longest)
-    # and get their own bucket.
-    #
-    # With SPECWRK_SRV_SPLIT_FILES=1, a file whose total run time exceeds the
-    # bucket target is first carved into example-level chunks that each fit the
-    # target (see split_oversized_file), so one chunky file can no longer pin a
-    # worker for a multiple of the target. Each chunk then packs like a file.
+    # Pack whole spec files into buckets, slowest file first, up to a target
+    # run time per bucket (SPECWRK_SRV_BUCKET_RUN_TIME seconds). A file's
+    # examples are never split across buckets — suites that redefine
+    # constants at file load need each file loaded at most once per worker.
+    # Files without timing data sort first (treated as longest) and get their
+    # own bucket. With SPECWRK_SRV_SPLIT_FILES=1, a file exceeding the bucket
+    # target is first carved into example-level chunks that each fit it.
     def group_by_batched_file(examples)
-      # A run time of 0 is synthesized (e.g. an example reported as unexecuted),
-      # not measured, so treat it like a missing timing. Otherwise zero-timed
-      # files sort last and all pack into one giant final bucket (0 + 0 + ...
-      # never exceeds the target) that no worker can finish.
-      # Each file also carries a fixed cost (require/load, per-file setup) that
-      # per-example run times don't capture, so charge file_overhead once per
-      # file: without it, hundreds of tiny-example files sum to "one bucket's
-      # worth" of run time whose true cost is dominated by the file loads.
+      # A run time of 0 is synthesized, not measured — treat it as missing,
+      # or zero-timed files all pack into one unfinishable final bucket.
+      # file_overhead charges the fixed require/setup cost per-example times
+      # don't capture, so many tiny files can't masquerade as one cheap bucket.
       file_run_time = lambda do |file_examples|
         file_overhead + file_examples.sum do |example|
           run_time = example[:expected_run_time]
@@ -192,10 +176,9 @@ module Specwrk
         end
       end
 
-      # Group by the example id's file component: metadata file_path is where
-      # the example is DEFINED, so every spec built from a shared example
-      # carries the shared-examples file as file_path — grouping by that fuses
-      # thousands of examples into one unsplittable pseudo-file mega-bucket.
+      # Group by the example id's file component, not metadata file_path:
+      # file_path is where an example is DEFINED, which for shared examples
+      # fuses everything into one unsplittable pseudo-file.
       file_groups = examples.group_by { |example| Specwrk.example_file_key(example) }
         .values
 
@@ -224,13 +207,10 @@ module Specwrk
       buckets
     end
 
-    # Carve one oversized file's examples into chunks that each fit the bucket
-    # run-time target. Each chunk becomes its own file load in whatever bucket
-    # it lands in, so every chunk is charged file_overhead. Only a file whose
-    # total is measured (finite) is split: with any unknown-timing example the
-    # total is unknowable, so the file keeps the whole-file unknown handling
-    # (its own bucket, dispatched first). A single example longer than the
-    # target gets a chunk to itself — that's the floor of what splitting can do.
+    # Carve one oversized file's examples into chunks that each fit the
+    # bucket target; each chunk is its own file load, so each is charged
+    # file_overhead. Only measured (finite) totals split — unknown-timing
+    # files keep the whole-file handling (own bucket, dispatched first).
     def split_oversized_file(file_examples, file_run_time)
       return [file_examples] unless file_run_time.call(file_examples).finite?
       return [file_examples] unless file_run_time.call(file_examples) > bucket_run_time_target

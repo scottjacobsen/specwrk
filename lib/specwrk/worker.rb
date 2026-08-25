@@ -25,9 +25,7 @@ module Specwrk
       FileUtils.mkdir_p(ENV["SPECWRK_OUT"]) if ENV["SPECWRK_OUT"]
 
       @running = true
-      # The data client logs every server call (heartbeats stay quiet); with
-      # one call per bucket that's cheap, and it makes server time visible
-      # inline instead of only in the end-of-run summary.
+      # One call per bucket, so logging them is cheap and shows server time inline
       @client = Client.new(log_requests: true)
       @heartbeat_client = Client.new
       @executor = Executor.new
@@ -53,13 +51,10 @@ module Specwrk
         @all_examples_completed = true
         break
       rescue NoMoreExamplesError
-        # The queue is drained for now. Wait briefly so a straggler's expired and
-        # requeued bucket can still be stolen — but NEVER wait forever. An
-        # orphaned/stuck bucket can mean the server never signals "all complete"
-        # (410), and a silent infinite wait here gets the CI job killed by a
-        # no-output timeout (~10m) long after the tests actually finished. Emit a
-        # timestamped line each cycle so the test→idle boundary is visible and
-        # output keeps flowing, then exit once the wait is exhausted.
+        # Queue drained for now: wait so a straggler's requeued bucket can
+        # still be stolen, but never forever — an orphaned bucket can mean
+        # 410 never comes, and a silent infinite wait gets the CI job killed
+        # by its no-output timeout long after the tests finished.
         @no_work_waits = (@no_work_waits || 0) + 1
         if @no_work_waits > no_work_max
           log_ts "queue drained (no work after #{@no_work_waits} checks) — exiting"
@@ -80,10 +75,8 @@ module Specwrk
           break
         end
       rescue PoisonedWorkerError
-        # register_poison! tripped: this node is failing everything instantly
-        # (broken node-local infrastructure). Stop popping so it can't vacuum
-        # the queue; the withheld bucket is reclaimed for a healthy worker
-        # once our heartbeats stop.
+        # Stop popping so a broken node can't vacuum the queue; the withheld
+        # bucket is reclaimed for a healthy worker once our heartbeats stop.
         @poisoned = true
         break
       end
@@ -94,11 +87,9 @@ module Specwrk
 
       print_summary
 
-      # The parent hard-exits via the init script (Process.exit! — at_exit is
-      # unsafe in a booted app), and forked children get ZEROED Coverage
-      # counters, so state recorded only in this parent — e.g. coverage of a
-      # Rails eager load during preload — must be flushed here like the
-      # children flush theirs.
+      # The parent hard-exits past at_exit like its children do, so state
+      # recorded only here (e.g. coverage of the preload) needs the same
+      # explicit flush the children get.
       Specwrk.before_fork_exit!
 
       status
@@ -109,10 +100,8 @@ module Specwrk
       warn "\nServer at #{ENV.fetch("SPECWRK_SRV_URI", "http://localhost:5138")} stopped responding to connections, exiting..."
       1
     rescue OpenSSL::SSL::SSLError => e
-      # The client retries a dead TLS keep-alive socket itself; one that stays
-      # dead past those retries lands here. Exit controlled rather than letting
-      # the raise crash the process (which loses the summary and reads as an
-      # unexplained node failure in CI).
+      # A TLS connection that stays dead past the client's own retries lands
+      # here; exit controlled instead of crashing away the summary.
       warn "\nTLS connection to #{ENV.fetch("SPECWRK_SRV_URI", "http://localhost:5138")} failed (#{e.message}), exiting..."
       1
     end
@@ -133,13 +122,10 @@ module Specwrk
       client.reconnect
     end
 
-    # Run one bucket of examples in a forked child, then report its results.
-    #
-    # Forking per bucket gives each bucket the clean, run-once global state a
-    # fresh CI process has: RSpec before(:suite) hooks, model callbacks/
-    # subscribers, and constant definitions execute once per child rather than
-    # accumulating across buckets in one reused process (which manifests as e.g.
-    # an audit event firing N times instead of once on the Nth bucket).
+    # Run one bucket in a forked child, then report its results. Forking per
+    # bucket gives each bucket the run-once global state a fresh process has:
+    # before(:suite) hooks, subscribers, and constants don't accumulate
+    # across buckets in one reused process.
     def execute
       examples = next_examples
       @no_work_waits = 0 # got work — reset the idle-exit counter
@@ -179,12 +165,10 @@ module Specwrk
       retry
     end
 
-    # Fork, run the bucket in the child, and hand its example results back to the
-    # parent through a tempfile. The HTTP client and heartbeat thread live solely
-    # in the parent, so the child never touches the shared server connection. If
-    # the child dies without writing results (e.g. a spec file crashes the
-    # process), the bucket's examples are reported as failures so the server can
-    # release them and the run still completes instead of hanging.
+    # Results come back from the child through a tempfile; the HTTP client and
+    # heartbeat thread live solely in the parent. A child that dies without
+    # writing results gets its examples reported as failures so the server can
+    # release them and the run completes instead of hanging.
     def run_in_fork(examples)
       bucket_started_at = Process.clock_gettime(Process::CLOCK_MONOTONIC)
       results_file = Tempfile.new("specwrk-bucket-results")
@@ -205,20 +189,12 @@ module Specwrk
 
       wait_status = wait_for_child(pid)
       if wait_status.nil?
-        # The child blew past the bucket timeout — usually a hung example (e.g. a
-        # wedged browser in a system spec), but sometimes a hang in the
-        # before_fork_exit flush AFTER the tests finished and the results file
-        # was fully written. Kill it rather than letting one hung process stall
-        # the whole node in an unbounded Process.wait2 until CI's no-output
-        # timeout kills the container — but salvage the results file if it is
-        # complete: those examples really ran, and reporting them all as failed
-        # would fail the node over an exit-hook hang unrelated to the tests.
-        #
-        # SIGQUIT goes first: killing outright destroys the evidence of WHERE
-        # the child hung. Its trap (install_quit_backtrace_trap) dumps every
-        # thread's backtrace to stderr and exits; SIGKILL only follows when the
-        # child is too far gone to run the trap (blocked in native code) — and
-        # that silence is itself diagnostic.
+        # Past the bucket timeout. SIGQUIT first — its trap dumps every
+        # thread's backtrace before exiting, and a child too far gone to run
+        # the trap (blocked in native code) tells its own story when SIGKILL
+        # follows. The hang may be in an exit-time flush AFTER the results
+        # were fully written, so a complete results file is salvaged rather
+        # than failing examples that really ran.
         log_ts "bucket exceeded #{bucket_timeout}s — sending SIGQUIT to child #{pid} for a thread dump"
         signal_child("QUIT", pid)
         unless wait_for_child(pid, timeout: quit_grace)
@@ -248,14 +224,8 @@ module Specwrk
       @metrics[:bucket_wall] += Process.clock_gettime(Process::CLOCK_MONOTONIC) - bucket_started_at
     end
 
-    # Installed as the first thing in every per-bucket child. When the parent
-    # decides the bucket is hung it sends SIGQUIT before SIGKILL; this trap
-    # writes every thread's backtrace to stderr (the node's job output) and
-    # exits, so a wedged child leaves the exact blocked frames behind instead
-    # of vanishing. Trap context forbids Mutex use, so only plain IO writes
-    # here. If the main thread is blocked in an uninterruptible native call
-    # the trap never runs and the parent's SIGKILL follows — the absence of a
-    # dump distinguishes a native-level block from a Ruby-level one.
+    # A wedged child leaves its blocked frames behind instead of vanishing.
+    # Trap context forbids Mutex use, so plain IO writes only.
     def install_quit_backtrace_trap
       Signal.trap("QUIT") do
         $stderr.write "\nspecwrk child #{Process.pid}: SIGQUIT thread dump\n"
@@ -280,11 +250,10 @@ module Specwrk
       end
     end
 
-    # Results from a killed child, if it got as far as writing them. nil unless
-    # the file holds complete, parseable JSON (File.write is a single call, so a
-    # kill mid-write leaves truncated JSON, which fails to parse). Any assigned
-    # example missing from a parsed file is synthesized as a failure so the
-    # server always gets a result for everything it handed out.
+    # Results from a killed child, if it got as far as writing them. nil
+    # unless the file parses (a kill mid-write leaves truncated JSON). Any
+    # assigned example missing from the file is synthesized as a failure so
+    # the server gets a result for everything it handed out.
     def salvage_bucket_results(examples, data)
       return if data.empty?
 
@@ -352,24 +321,18 @@ module Specwrk
       @quit_grace ||= ENV.fetch("SPECWRK_QUIT_GRACE", "5").to_f
     end
 
-    # How many empty /pop checks (0.5s apart) to tolerate before a worker gives up
-    # waiting for stragglers and exits. Default ~60s — long enough to steal an
-    # expired/requeued bucket (heartbeat expiry is ~20s), short enough to never
-    # trip CI's no-output timeout. Override with SPECWRK_NO_WORK_WAITS.
+    # Empty /pop checks (0.5s apart) tolerated before a worker exits. Must
+    # outlast the server's bucket-expiry reclaim or a dead node's work is
+    # never stolen. Override with SPECWRK_NO_WORK_WAITS.
     def no_work_max
       @no_work_max ||= ENV.fetch("SPECWRK_NO_WORK_WAITS", "120").to_i
     end
 
-    # Circuit breaker for a poisoned node: broken node-local infrastructure
-    # (e.g. a dead ClickHouse) insta-fails every bucket and vacuums the queue,
-    # terminally failing healthy examples fleet-wide. The signature — every
-    # example in the bucket failed, in near-zero run time, N buckets in a row
-    # — is distinct from a legitimately failing bucket, whose examples either
-    # take real time or don't all fail. On the Nth consecutive hit the
-    # tripping bucket's results are withheld (the raise skips
-    # complete_examples) so the server's heartbeat expiry requeues them for a
-    # healthy worker; the N-1 earlier buckets were already reported. The
-    # worker then exits red via #status.
+    # A node with broken local infrastructure insta-fails every bucket and
+    # vacuums the queue. Its signature — every example failed, near-zero run
+    # time, N buckets in a row — is distinct from a legitimately failing
+    # bucket. The raise withholds the tripping bucket's results so expiry
+    # requeues them for a healthy worker; the worker then exits red.
     def register_poison!(results)
       return if poison_bucket_max.zero?
 
@@ -406,17 +369,13 @@ module Specwrk
       @poison_avg_seconds ||= ENV.fetch("SPECWRK_POISON_AVG_SECONDS", "0.1").to_f
     end
 
-    # Max seconds to wait for a single bucket's child before killing it as hung.
-    # Well above any legit bucket (buckets target ~10s of run time) and below CI's
-    # ~10m no-output timeout, so a wedged example fails its bucket instead of
-    # stalling the whole node. Override with SPECWRK_BUCKET_TIMEOUT.
+    # Max seconds for a bucket's child before it is killed as hung — a wedged
+    # example fails its bucket instead of stalling the whole node. Override
+    # with SPECWRK_BUCKET_TIMEOUT.
     def bucket_timeout
       @bucket_timeout ||= ENV.fetch("SPECWRK_BUCKET_TIMEOUT", "300").to_i
     end
 
-    # Announce the bucket before its child forks, including the exact rspec
-    # command that reproduces it — the single most-wanted thing when a bucket
-    # fails in CI is "how do I run just that bucket locally".
     def log_bucket_start(bucket, examples)
       files = examples.map { |example| example[:id].to_s.split("[", 2).first }.uniq
       log_ts "bucket #{bucket}: #{examples.length} examples from #{files.length} file#{"s" unless files.length == 1}"
@@ -452,15 +411,10 @@ module Specwrk
       "bundle exec rspec#{rspec_seed_options} #{args.join(" ")}"
     end
 
-    # --seed pins RSpec's random ordering — and anything the app derives from
-    # it (e.g. spec_helper's `srand config.seed`, Faker seeding) — so the
-    # rerun executes the bucket exactly as CI did, which is the difference
-    # that matters when hunting order-dependent flakes. Every bucket child
-    # forks from this preloaded parent, so they all share its seed. Appended
-    # only when random ordering is configured: --seed implies --order rand,
-    # which would CHANGE the order of an identity-ordered suite (including
-    # the no-preload case, where the app config isn't loaded yet and each
-    # child picks its own unknowable seed).
+    # --seed pins random ordering (and anything the app derives from the
+    # seed) so the rerun executes the bucket exactly as this run did.
+    # Appended only when random ordering is configured: --seed implies
+    # --order rand, which would CHANGE an identity-ordered suite's order.
     def rspec_seed_options
       @rspec_seed_options ||= if RSpec.configuration.ordering_registry.fetch(:global).is_a?(RSpec::Core::Ordering::Random)
         " --seed #{RSpec.configuration.seed}"
@@ -469,22 +423,14 @@ module Specwrk
       end
     end
 
-    # Timestamped line to stdout so the CI log shows when each bucket finished and
-    # where the test→idle boundary is (specwrk's own output is otherwise untimed).
     def log_ts(msg)
       $stdout.puts "[#{Time.now.utc.iso8601}] #{ENV.fetch("SPECWRK_ID", "specwrk-worker")}: #{msg}"
       $stdout.flush
     end
 
-    # Always-on, local, per-worker end-of-run metrics — independent of
-    # SPECWRK_RUN_SUMMARY (that gate is on the CLI's Work command and drives a
-    # /report fetch; this is local bookkeeping, no network call). Lines are
-    # prefixed "summary:" so they're easy to grep out of a CI log across many
-    # worker nodes. No averages/divisions, so a zero-bucket run just prints
-    # zeros — no guards needed.
-    #
-    # This runs before the coverage flush (see the call site in #run), so a
-    # raise here must never take that flush down with it — best-effort only.
+    # Local bookkeeping only, no network call (unlike SPECWRK_RUN_SUMMARY's
+    # /report fetch). Runs before the coverage flush, so a raise here must
+    # never take that flush down with it — best-effort only.
     def print_summary
       fork_overhead = metrics[:bucket_wall] - metrics[:example_time]
       log_ts format("summary: buckets=%d examples=%d bucket_wall=%.1fs example_time=%.1fs fork_overhead=%.1fs",
@@ -504,10 +450,8 @@ module Specwrk
       log_ts format("summary: server calls=%d time=%.1fs [%s] heartbeat=%d/%.1fs (counts are attempts incl. retries; heartbeats ran concurrently)",
         data_calls, data_time, endpoints, heartbeat_calls, heartbeat_time)
 
-      # Data-client calls are serial with buckets (the worker fetches/completes
-      # between buckets, never during one), so this decomposition holds true.
-      # Heartbeats run concurrently on their own connection and are deliberately
-      # excluded.
+      # Data-client calls are serial with buckets, so this decomposition holds;
+      # heartbeats run concurrently and are deliberately excluded.
       run_wall = Process.clock_gettime(Process::CLOCK_MONOTONIC) - @run_started_at
       other = run_wall - metrics[:bucket_wall] - data_time
 
@@ -524,10 +468,8 @@ module Specwrk
       return 0 if @all_examples_completed && client.worker_status.zero?
       return 1 if Specwrk.force_quit
 
-      # This becomes the process exit status (the init script exit!s with it),
-      # and POSIX keeps only the low 8 bits — a raw failure count of exactly 256
-      # (or any multiple) would truncate to 0 and report a failing worker as
-      # green. Clamp; counts under 255 still come through exactly.
+      # POSIX keeps only the low 8 bits of an exit status — a failure count
+      # of exactly 256 would truncate to 0 and read as green.
       client.worker_status.clamp(0, 255)
     end
 

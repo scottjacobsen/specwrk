@@ -38,16 +38,11 @@ module Specwrk
 
         private
 
-        # Deduplicated by id with pass-beats-fail semantics: when one payload
-        # carries several attempts of the same example (duplicate executions),
-        # a failed record never displaces a non-failed one — otherwise the
-        # last record would win regardless of order and a flake's failing
-        # attempt could complete an example that actually passed.
-        #
-        # Results whose processing entries are GONE are accepted too: they're
-        # a falsely-expired bucket's original owner reporting after the
-        # reclaim erased its entries. That work really ran — discarding it
-        # threw away real outcomes. The request-id replay layer still guards
+        # Deduplicated by id with pass-beats-fail semantics: a failed record
+        # never displaces a non-failed one within the payload. Results whose
+        # processing entries are GONE are accepted too — a falsely-expired
+        # bucket's original owner reporting after the reclaim erased its
+        # entries did real work; the request-id replay layer still guards
         # duplicate requests.
         def all_examples
           @all_examples ||= payload.each_with_object({}) do |example, examples|
@@ -168,14 +163,10 @@ module Specwrk
         end
 
         def run_time_data
-          # Record run times ONLY for passed examples. Synthesized results
-          # (unexecuted examples reported as failed after a child died) carry
-          # run_time 0.0, but real failures and skips also poison the store:
-          # a cascade that fails everything instantly (e.g. one bad connection
-          # state) records microsecond "measured" times for hundreds of
-          # browser specs, and the next run's batched grouping packs them all
-          # into one unfinishable mega-bucket. Passed times are the only
-          # trustworthy scheduling signal.
+          # Passed times are the only trustworthy scheduling signal: an
+          # instant-failure cascade records microsecond "measured" times, and
+          # the next run's grouping would pack those files into one
+          # unfinishable mega-bucket.
           @run_time_data ||= payload.filter_map { |example|
             next unless example[:status] == "passed"
 

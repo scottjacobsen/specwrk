@@ -16,15 +16,10 @@ Specwrk.net_http = Net::HTTP
 
 module Specwrk
   class Client
-    # POST bodies at least this large go out gzipped. The seed for a large
-    # suite is tens of megabytes of JSON that deflates ~25x, so the fraction
-    # of a second it costs to compress buys back most of the upload; below
-    # the threshold there is no transfer worth the CPU on either end.
-    #
-    # The server inflates any body carrying Content-Encoding: gzip, and one
-    # that predates that support would try to JSON.parse the compressed
-    # bytes — so a client this new REQUIRES a server at least as new. Deploy
-    # the server first.
+    # POST bodies at least this large go out gzipped (a large seed is tens of
+    # MB of JSON that deflates ~25x). The server inflates by Content-Encoding,
+    # and one predating that support would JSON.parse compressed bytes — a
+    # client this new requires a server at least as new. Deploy server first.
     GZIP_MIN_BYTES = 64 * 1024
 
     def self.connect?
@@ -36,9 +31,8 @@ module Specwrk
     rescue Errno::ECONNREFUSED, Errno::EHOSTUNREACH, OpenSSL::SSL::SSLError,
       Net::OpenTimeout, IO::TimeoutError
       # A connect timeout is the same answer as a refused connection: not up
-      # yet. wait_for_server! polls this in a loop, and letting the timeout
-      # raise crashed whole workers during the boot herd (thousands of
-      # simultaneous TLS handshakes against one load balancer).
+      # yet. wait_for_server! polls this in a loop; raising crashed workers
+      # during boot herds.
       false
     end
 
@@ -46,10 +40,7 @@ module Specwrk
       uri = URI(ENV.fetch("SPECWRK_SRV_URI", "http://localhost:5138"))
       Specwrk.net_http.new(uri.host, uri.port).tap do |http|
         http.use_ssl = uri.scheme == "https"
-        # Self-signed server certs (e.g. a local/CI-only server): skip
-        # verification rather than failing every connection. Gated on
-        # use_ssl? so a plain-http connection never carries a misleading
-        # verify_mode.
+        # Opt-out for self-signed server certs (e.g. a CI-only server)
         http.verify_mode = OpenSSL::SSL::VERIFY_NONE if http.use_ssl? && ENV["SPECWRK_SSL_NO_VERIFY"]
         http.open_timeout = ENV.fetch("SPECWRK_TIMEOUT", "5").to_i
         http.read_timeout = ENV.fetch("SPECWRK_TIMEOUT", "5").to_i
@@ -71,21 +62,17 @@ module Specwrk
 
     attr_reader :last_request_at, :retry_count, :worker_status, :stats
 
-    # log_requests: emit one timestamped line per HTTP attempt (method, path,
-    # response code, duration). On for a worker's data client so CI output
-    # shows exactly when the server was called and what it cost; off for the
-    # heartbeat client, which would otherwise add a line every ~10s.
-    # The connection is NOT opened here: an eager connect made a TCP timeout
-    # (IO::TimeoutError) at construction crash the worker before
-    # wait_for_server! ever ran. make_request opens it lazily on first use.
+    # log_requests: one timestamped line per HTTP attempt. The connection is
+    # NOT opened here — an eager connect made a TCP timeout at construction
+    # crash the worker before wait_for_server! ever ran; make_request opens
+    # it lazily.
     def initialize(log_requests: false)
       @log_requests = log_requests
       @mutex = Mutex.new
       @http = self.class.build_http
       @worker_status = 1
-      # Per-instance, keyed by request path ("/pop" etc — paths ARE the
-      # endpoint names). make_request already holds @mutex for the whole
-      # attempt loop, so writes here are lock-free-safe.
+      # Keyed by request path; make_request holds @mutex for the whole
+      # attempt loop, so writes here need no extra lock.
       @stats = Hash.new { |h, path| h[path] = {calls: 0, duration: 0.0} }
     end
 
@@ -93,10 +80,9 @@ module Specwrk
       @mutex.synchronize { @http.finish if @http.started? }
     end
 
-    # For long idle gaps the caller knows about (e.g. a minutes-long app
-    # preload): the server drops the keep-alive socket well before then, so
-    # the next request would pay a logged EOFError retry. Reconnecting up
-    # front keeps that noise out of the output.
+    # For long idle gaps the caller knows about (e.g. an app preload): the
+    # server drops the keep-alive socket well before then, and reconnecting
+    # up front beats paying a logged EOFError retry on the next request.
     def reconnect
       @mutex.synchronize { reconnect! }
     end
@@ -169,12 +155,10 @@ module Specwrk
 
     private
 
-    # /pop and /complete_and_pop are non-idempotent (one request both records
-    # results and hands out the next bucket), yet make_request retries them
-    # when a response is lost mid-flight. A fresh id per LOGICAL call — reused
-    # verbatim across that call's retries, since the Net::HTTP request object
-    # is built once — lets the server recognize a duplicate and replay its
-    # recorded response instead of processing the request twice.
+    # /pop and /complete_and_pop are non-idempotent, yet make_request retries
+    # them when a response is lost mid-flight. A fresh id per LOGICAL call,
+    # reused across its retries, lets the server replay its recorded response
+    # instead of processing the request twice.
     def idempotency_headers
       default_headers.merge("x-specwrk-request-id" => SecureRandom.uuid)
     end
@@ -209,25 +193,20 @@ module Specwrk
       make_request(request)
     end
 
-    # Non-mutating on both arguments: default_headers is memoized and shared
-    # by every request this client makes, so the gzip marker has to go on a
-    # copy. Compressing here, before the request object is built, also means
-    # make_request's retries re-send the already-compressed body rather than
-    # deflating it again per attempt.
+    # Non-mutating: default_headers is memoized and shared, so the gzip
+    # marker goes on a copy. Retries re-send the already-compressed body.
     def maybe_gzip(body, headers)
       return [body, headers] if body.nil? || body.bytesize < GZIP_MIN_BYTES
 
       [Zlib.gzip(body), headers.merge("Content-Encoding" => "gzip")]
     end
 
-    # The retry loop lives INSIDE @mutex.synchronize (unlike a plain rescue on
-    # the method, which would release the mutex between attempts) so a
-    # reconnect can never race another thread's request on this same client:
-    # @http gets torn down and rebuilt while still exclusively held.
+    # The retry loop lives INSIDE @mutex.synchronize so a reconnect can never
+    # race another thread's request on this client: @http is torn down and
+    # rebuilt while still exclusively held.
     def make_request(request)
       @mutex.synchronize do
-        # Re-stamped on every retry: `retry` re-enters right here, at the top
-        # of the block, so each attempt gets its own start time.
+        # `retry` re-enters here, so each attempt gets its own start time
         attempt_started_at = Process.clock_gettime(Process::CLOCK_MONOTONIC)
         @last_request_at = Time.now
         # Explicit rather than letting Net::HTTP#request auto-start, which
@@ -243,23 +222,18 @@ module Specwrk
         end
       rescue Net::ReadTimeout, Net::WriteTimeout, Net::OpenTimeout, IO::TimeoutError => e
         # The open-timeout pair comes from the lazy @http.start above; no
-        # reconnect needed — the next attempt just opens again.
-        # `ensure` does not run on `retry`, so record explicitly here rather
-        # than relying on an ensure to cover every attempt.
+        # reconnect needed. `ensure` does not run on `retry`, so each rescue
+        # records its own attempt.
         record_attempt(request.path, attempt_started_at)
         log_attempt(request, e.class, attempt_started_at)
         retry_or_raise!(e)
         retry
       rescue Errno::ECONNRESET, Errno::EPIPE, IOError, OpenSSL::SSL::SSLError => e
-        # A keep-alive connection Puma (or another server-side idle timeout)
-        # closed while this client held it open goes undetected until the next
-        # request tries to reuse it: Net::HTTP only auto-retries idempotent
-        # methods on a dead keep-alive socket, so a POST surfaces one of these
-        # (IOError covers EOFError, a subclass) instead of a clean refusal.
-        # On TLS the same death arrives as OpenSSL::SSL::SSLError ("SSL_read:
-        # unexpected eof while reading") — not an IOError subclass, so it must
-        # be rescued by name. Reconnect before retrying so the retry isn't
-        # doomed to hit the same dead socket again.
+        # A server-side idle timeout kills a keep-alive socket undetected;
+        # Net::HTTP only auto-retries idempotent methods, so a POST surfaces
+        # one of these instead of a clean refusal. On TLS the death arrives
+        # as OpenSSL::SSL::SSLError, not an IOError subclass. Reconnect so
+        # the retry isn't doomed to the same dead socket.
         record_attempt(request.path, attempt_started_at)
         log_attempt(request, e.class, attempt_started_at)
         retry_or_raise!(e)
@@ -274,9 +248,8 @@ module Specwrk
       entry[:duration] += Process.clock_gettime(Process::CLOCK_MONOTONIC) - started_at
     end
 
-    # Retries log one line each (outcome is the exception class), so a
-    # timing-out server shows up as N slow attempts rather than one opaque
-    # multi-second gap in the worker's output.
+    # Logged per attempt, so a timing-out server shows N slow attempts rather
+    # than one opaque gap.
     def log_attempt(request, outcome, started_at)
       return unless @log_requests
 

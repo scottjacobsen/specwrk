@@ -11,15 +11,11 @@ module Specwrk
 
         private
 
-        # /pop and /complete_and_pop each both mutate state AND hand out a
-        # bucket, so they cannot be safely retried — yet the client retries
-        # them when a response is lost mid-flight (e.g. connection reset after
-        # the server finished processing). Without this, the retry of a request
-        # the server already handled would run the endpoint AGAIN: the same
-        # results double-tallied and, worse, a second bucket shifted to the
-        # worker while the first sits orphaned in processing under its name —
-        # heartbeat-alive, so never reclaimed. Record each response against the
-        # client-sent request id and replay it verbatim for a duplicate.
+        # /pop and /complete_and_pop both mutate state AND hand out a bucket,
+        # yet the client retries them when a response is lost mid-flight.
+        # Re-running a request the server already handled double-tallies
+        # results and orphans the first bucket in processing — so record each
+        # response against the client-sent request id and replay duplicates.
         def idempotent
           if request_id.empty?
             record_worker_contact!
@@ -46,40 +42,29 @@ module Specwrk
           elsif pending.empty? && processing.empty? && completed.empty?
             [204, {"content-type" => "text/plain"}, ["Waiting for sample to be seeded."]]
           elsif reclaim_expired_examples.any?
-            # A worker missed its heartbeats; reclaim its in-flight examples back
-            # onto the queue so a live worker can run them. Checked BEFORE the
-            # all-done response so dead-worker work is recovered, not abandoned.
+            # Checked BEFORE the all-done response so a dead worker's
+            # in-flight examples are recovered, not abandoned.
             @examples = nil
 
             if examples.any?
               [200, {"content-type" => "application/json"}, [JSON.generate(examples)]]
             else
-              # Every reclaimed bucket was already stolen by another poller
-              # before we got back around to handing one out. 404 so this
-              # worker polls again, rather than 200 it an empty array.
+              # Another poller stole every reclaimed bucket first; 404 so
+              # this worker polls again rather than 200 with an empty array.
               not_found
             end
           elsif completed.any? && pending.length.zero? && !stale_in_flight_work?
-            # The bucket queue is drained and there's nothing to reclaim, so there
-            # is no more work to hand out: tell the worker to go home. This used to
-            # require processing.empty?, but a straggler left in processing (whose
-            # owning worker is alive but idle) would then NEVER clear, so this 410
-            # never fired and workers spin-polled /pop forever — starving the
-            # single-process server until CI killed everyone on the no-output
-            # timeout. Keying off the drained queue instead terminates cleanly;
-            # any worker still running a bucket finishes and gets this on its next
-            # request (its results are recorded before this response).
-            #
-            # stale_in_flight_work? carves out the dead-worker case: 410 is
-            # terminal, so if in-flight work belongs to a worker that has stopped
-            # heartbeating and everyone else goes home before the expiry scan
-            # requeues it, nobody is left to run it and the run "drains" with
-            # examples that never ran. 404 instead keeps the pollers around until
-            # a scan reclaims the bucket and hands it back out.
+            # Bucket queue drained and nothing reclaimable: go home. Keyed off
+            # the drained queue, NOT processing.empty? — a live-but-idle
+            # straggler in processing would keep this 410 from ever firing and
+            # workers would spin-poll forever. stale_in_flight_work? carves out
+            # the dead-worker case: 410 is terminal, so pollers must stay
+            # around until an expiry scan requeues a dead worker's bucket —
+            # otherwise the run "drains" with examples that never ran.
             #
             # The 410 is this worker's clean exit — drop it from the workers
-            # index so /metrics counts as "stale" only workers that vanished
-            # mid-run, not everyone who finished and went home.
+            # index so /metrics counts only workers that vanished mid-run as
+            # stale.
             workers_index.delete(worker_id) unless worker_id.empty?
 
             [410, {"content-type" => "text/plain"}, ["That's a good lad. Run along now and go home."]]
@@ -115,20 +100,12 @@ module Specwrk
           end
         end
 
-        # Reclaim examples whose owning worker has missed its heartbeats, requeuing
-        # them onto pending. Gated by expiry_check_due? so an empty-pop stampede
-        # (e.g. dozens of idle workers post-drain) doesn't each run a full scan of
-        # the in-flight index every request — at most one scan per
-        # SPECWRK_SRV_EXPIRY_CHECK_INTERVAL actually walks it, and that scan
-        # (plus the requeue) happens under the store lock so concurrent checkers
-        # collapse into it rather than duplicating the work or the requeue.
-        #
-        # The scan works from the in-flight index (one small record per worker),
-        # never from the processing payloads: at tens of thousands of in-flight
-        # examples a full processing read is multi-MB, and doing that under the
-        # per-run lock let a degraded store push the scan toward the lock's
-        # deadman. Payloads are read only for the stale workers' examples — the
-        # ones actually being requeued, normally none.
+        # Requeue examples whose owning worker has missed its heartbeats.
+        # At most one scan per SPECWRK_SRV_EXPIRY_CHECK_INTERVAL runs, under
+        # the store lock, so an empty-pop stampede collapses into it. The
+        # scan reads the in-flight index (one small record per worker), never
+        # the multi-MB processing payloads — those are read only for the
+        # stale workers' examples actually being requeued, normally none.
         def reclaim_expired_examples
           @reclaim_expired_examples ||= if processing.empty? || !expiry_check_due?
             {}
@@ -170,21 +147,13 @@ module Specwrk
           Time.now.to_i - (metadata[LAST_EXPIRY_CHECK_AT_KEY] || 0) >= expiry_check_interval
         end
 
-        # In-flight work owned by a worker that has missed its heartbeats. Such
-        # work is (or is about to be) reclaimable, so the drained-queue 410 must
-        # not send the remaining pollers home past it. Live owners don't count:
-        # their buckets finish on their own and must not hold up the drain.
-        #
-        # Answered from the verdict the reclaim scan caches, NOT by scanning
-        # anything: this runs on EVERY empty pop, and thousands of idle workers
-        # polling a draining run once made these scans saturate the store's
-        # bandwidth — slowing the very heartbeats whose absence they were
-        # looking for, falsely expiring workers fleet-wide. The cached verdict
-        # is safe to trust between scans: whenever this runs with work in
-        # flight, reclaim_expired_examples has either just scanned or found a
-        # scan under EXPIRY_CHECK_INTERVAL old, and no bucket can turn stale
-        # sooner than the cached horizon. A missing verdict means unknown —
-        # assume stale, hold the pollers, and let the next scan write one.
+        # In-flight work owned by a worker that has missed its heartbeats —
+        # reclaimable, so the drained-queue 410 must not send the remaining
+        # pollers home past it. Live owners don't count: their buckets finish
+        # on their own. Answered from the verdict the reclaim scan caches,
+        # never by scanning here: this runs on EVERY empty pop, and no bucket
+        # can turn stale sooner than the cached horizon. A missing verdict
+        # means unknown — assume stale and let the next scan write one.
         def stale_in_flight_work?
           return false if processing.empty?
 
@@ -206,10 +175,8 @@ module Specwrk
         end
 
         # Per-run worker_id -> {ids:, processing_started_at:} record of the
-        # bucket each worker currently holds, maintained on every handout and
-        # completion. Exists so staleness questions are answered from
-        # worker-count-sized records; the processing store's full payloads are
-        # only ever read for examples being requeued.
+        # bucket each worker holds, so staleness questions are answered from
+        # worker-count-sized records instead of processing payloads.
         def in_flight
           @in_flight ||= Store.new(ENV.fetch("SPECWRK_SRV_STORE_URI", "memory:///"), File.join(run_scope, "in_flight"), ttl: run_ttl)
         end
