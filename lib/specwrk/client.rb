@@ -147,8 +147,16 @@ module Specwrk
       end
     end
 
-    def seed(examples, max_retries)
-      response = post "/seed", body: {max_retries: max_retries, examples: examples}.to_json
+    # The bucketing overrides go in the payload only when provided: 0 is a
+    # meaningful value for both (disables the per-file charge / forces
+    # one-file-per-bucket), so absent must stay distinguishable from 0 — an
+    # absent key leaves the server's env-configured behavior untouched.
+    def seed(examples, max_retries, bucket_run_time: nil, file_overhead: nil)
+      body = {max_retries: max_retries, examples: examples}
+      body[:bucket_run_time] = bucket_run_time unless bucket_run_time.nil?
+      body[:file_overhead] = file_overhead unless file_overhead.nil?
+
+      response = post "/seed", body: body.to_json
 
       (response.code == "200") ? true : raise(UnhandledResponseError.new("#{response.code}: #{response.body}"))
     end

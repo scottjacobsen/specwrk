@@ -44,6 +44,49 @@ RSpec.describe Specwrk::PendingStore do
     it { is_expected.to eq(4) }
   end
 
+  describe "#bucket_run_time_target" do
+    subject { instance.bucket_run_time_target }
+
+    it "falls back to the env value when nothing is stored" do
+      stub_const("ENV", ENV.to_h.merge("SPECWRK_SRV_BUCKET_RUN_TIME" => "2.5"))
+
+      is_expected.to eq(2.5)
+    end
+
+    it "defaults to 0 with no stored value and no env" do
+      stub_const("ENV", ENV.to_h.except("SPECWRK_SRV_BUCKET_RUN_TIME"))
+
+      is_expected.to eq(0.0)
+    end
+
+    it "prefers the stored per-run value over the env, visible to a fresh instance" do
+      # The requeue and retry paths regroup examples from their own store
+      # instances, so a per-run override has to be persisted, not request-local.
+      stub_const("ENV", ENV.to_h.merge("SPECWRK_SRV_BUCKET_RUN_TIME" => "2.5"))
+      instance.bucket_run_time_target = 10.0
+
+      expect(described_class.new(uri_string, scope).bucket_run_time_target).to eq(10.0)
+    end
+  end
+
+  describe "#file_overhead" do
+    subject { instance.file_overhead }
+
+    it "falls back to the env value when nothing is stored" do
+      stub_const("ENV", ENV.to_h.merge("SPECWRK_SRV_FILE_OVERHEAD" => "1.5"))
+
+      is_expected.to eq(1.5)
+    end
+
+    it "prefers a stored zero over a non-zero env value" do
+      # 0 disables the per-file charge, so an explicit 0 must win over the env.
+      stub_const("ENV", ENV.to_h.merge("SPECWRK_SRV_FILE_OVERHEAD" => "1.0"))
+      instance.file_overhead = 0.0
+
+      expect(described_class.new(uri_string, scope).file_overhead).to eq(0.0)
+    end
+  end
+
   describe "#max_retries=" do
     subject { instance.max_retries = 3 }
 
@@ -253,6 +296,36 @@ RSpec.describe Specwrk::PendingStore do
 
         # Each file costs 0.1 + 1.0 overhead = 1.1; the 2.5s target fits two
         # files per bucket, so five files land in three buckets instead of one.
+        bucket_sizes = []
+        while (bucket_id = instance.shift_bucket)
+          bucket_sizes << bucket_for(bucket_id).examples.length
+        end
+
+        expect(bucket_sizes).to eq([2, 2, 1])
+      end
+
+      it "prefers a stored per-run target over the env when grouping" do
+        # Env says batch up to 2.5s; the seed for this run stored 0, which
+        # forces the legacy one-file-per-bucket path.
+        instance.bucket_run_time_target = 0.0
+
+        instance.merge!({
+          "a.rb:1": {id: "a.rb:1", expected_run_time: 0.5, file_path: "a.rb"},
+          "b.rb:1": {id: "b.rb:1", expected_run_time: 0.5, file_path: "b.rb"}
+        })
+
+        expect(instance.bucket_ids.length).to eq(2)
+      end
+
+      it "charges a stored per-run file overhead over the env default" do
+        # Same shape as the env-driven overhead test above, but the value
+        # comes from the store (no SPECWRK_SRV_FILE_OVERHEAD in the env).
+        instance.file_overhead = 1.0
+
+        instance.merge!((1..5).to_h { |n|
+          [:"f#{n}.rb:1", {id: "f#{n}.rb:1", expected_run_time: 0.1, file_path: "f#{n}.rb"}]
+        })
+
         bucket_sizes = []
         while (bucket_id = instance.shift_bucket)
           bucket_sizes << bucket_for(bucket_id).examples.length

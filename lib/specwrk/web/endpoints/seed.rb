@@ -16,6 +16,10 @@ module Specwrk
 
           pending.max_retries = payload.fetch(:max_retries, "0").to_i
 
+          # Presence, not truthiness: 0 is a meaningful override.
+          pending.bucket_run_time_target = Float(payload[:bucket_run_time]) if payload.key?(:bucket_run_time)
+          pending.file_overhead = Float(payload[:file_overhead]) if payload.key?(:file_overhead)
+
           new_run_time_bucket_maximums = [pending.run_time_bucket_maximum, @seeds_run_time_bucket_maximum.to_f].compact
           pending.run_time_bucket_maximum = new_run_time_bucket_maximums.sum.to_f / new_run_time_bucket_maximums.length.to_f
 

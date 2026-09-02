@@ -54,6 +54,32 @@ RSpec.describe Specwrk::CLI::Seed do
       # up too.
       expect(ENV["SPECWRK_SEED_JOBS"]).to eq("4")
     end
+
+    context "with examples enumerated" do
+      let(:examples) { [{id: "a.rb:1", file_path: "a.rb"}] }
+      let(:client) { instance_double(Specwrk::Client) }
+
+      before do
+        allow(Specwrk::ListExamples).to receive(:new)
+          .and_return(instance_double(Specwrk::ListExamples, examples: examples))
+        allow(Specwrk::Client).to receive(:wait_for_server!)
+        allow(Specwrk::Client).to receive(:new).and_return(client)
+      end
+
+      it "passes no bucketing overrides when the options are absent" do
+        expect(client).to receive(:seed).with(examples, 0, bucket_run_time: nil, file_overhead: nil)
+
+        expect { instance.call(max_retries: 0, jobs: 1, dir: [], **client_env) }
+          .to output(/Seeded 1 examples/).to_stdout
+      end
+
+      it "converts the bucketing overrides to floats, keeping an explicit 0" do
+        expect(client).to receive(:seed).with(examples, 0, bucket_run_time: 12.5, file_overhead: 0.0)
+
+        expect { instance.call(max_retries: 0, jobs: 1, dir: [], bucket_run_time: "12.5", file_overhead: "0", **client_env) }
+          .to output(/Seeded 1 examples/).to_stdout
+      end
+    end
   end
 end
 

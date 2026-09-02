@@ -649,6 +649,31 @@ RSpec.describe Specwrk::Client do
       end
 
       it { is_expected.to be true }
+
+      it "omits the bucketing override keys so the server's env values stay in charge" do
+        subject
+
+        expect(WebMock).to have_requested(:post, "#{base_uri}/seed")
+          .with(body: {max_retries: max_retries, examples: examples}.to_json)
+      end
+    end
+
+    # 0 is a meaningful override (it disables the per-file charge / forces
+    # one-file-per-bucket), so provided values — including 0 — go in the
+    # payload and absent ones stay out entirely.
+    context "with per-run bucketing overrides" do
+      subject { client.seed(examples, max_retries, bucket_run_time: 2.5, file_overhead: 0.0) }
+
+      before do
+        stub_request(:post, "#{base_uri}/seed").to_return(status: 200)
+      end
+
+      it "includes both keys in the payload" do
+        expect(subject).to be true
+
+        expect(WebMock).to have_requested(:post, "#{base_uri}/seed")
+          .with(body: {max_retries: max_retries, examples: examples, bucket_run_time: 2.5, file_overhead: 0.0}.to_json)
+      end
     end
 
     context "when response is error" do

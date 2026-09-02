@@ -34,6 +34,43 @@ RSpec.describe Specwrk::Web::Endpoints::Seed do
     end
   end
 
+  context "with per-run bucketing overrides in the payload" do
+    let(:env_vars) { super().merge("SPECWRK_SRV_GROUP_BY" => "file") }
+    let(:existing_run_times_data) { {"a.rb:1": 1.0, "b.rb:1": 1.0} }
+    let(:body) do
+      JSON.generate(
+        bucket_run_time: 2.5,
+        file_overhead: 0.1,
+        examples: [
+          {id: "a.rb:1", file_path: "a.rb"},
+          {id: "b.rb:1", file_path: "b.rb"}
+        ]
+      )
+    end
+
+    it "persists the overrides on the pending store for later regrouping (requeue/retry paths)" do
+      expect { subject }.to change { pending.reload.bucket_run_time_target }.from(0.0).to(2.5)
+        .and change { pending.reload.file_overhead }.from(0.0).to(0.1)
+    end
+
+    it "groups this seed with the overrides: both files batch into one bucket" do
+      subject
+
+      bucket_id = pending.shift_bucket
+      expect(Specwrk::BucketStore.new(datastore_uri, run_scope("pending", "buckets", bucket_id)).examples.map { |ex| ex[:id] }).to match_array(%w[a.rb:1 b.rb:1])
+      expect(pending.shift_bucket).to be_nil
+    end
+  end
+
+  context "without bucketing overrides in the payload" do
+    it "stores nothing, leaving the server env in charge" do
+      subject
+
+      expect(pending.reload[Specwrk::PendingStore::BUCKET_RUN_TIME_TARGET_KEY]).to be_nil
+      expect(pending.reload[Specwrk::PendingStore::FILE_OVERHEAD_KEY]).to be_nil
+    end
+  end
+
   # The seed body is by far the largest request specwrk sends — tens of
   # megabytes of JSON for a large suite, which gzip shrinks ~25x. The
   # compressed body has to seed exactly what the plain one does.

@@ -116,6 +116,8 @@ Options:
   --timeout=VALUE, -t VALUE         # The amount of time to wait for the server to respond. Overrides SPECWRK_TIMEOUT, default: "5"
   --network-retries=VALUE           # The number of times to retry in the event of a network failure. Overrides SPECWRK_NETWORK_RETRIES, default: "1"
   --max-retries=VALUE               # Number of times an example will be re-run should it fail, default: 0
+  --bucket-run-time=VALUE           # Per-run target run time (seconds) per bucket when the server batches whole files; overrides the server's SPECWRK_SRV_BUCKET_RUN_TIME for this run. Defaults to SPECWRK_SRV_BUCKET_RUN_TIME if set; when absent, the server's env decides
+  --file-overhead=VALUE             # Per-run seconds charged per file when packing batched buckets; overrides the server's SPECWRK_SRV_FILE_OVERHEAD for this run. Defaults to SPECWRK_SRV_FILE_OVERHEAD if set; when absent, the server's env decides
   --help, -h                        # Print this help
 ```
 

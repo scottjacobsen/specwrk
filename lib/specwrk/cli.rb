@@ -180,9 +180,13 @@ module Specwrk
       desc "Seed the server with a list of specs for the run"
       option :max_retries, default: 0, desc: "Number of times an example will be re-run should it fail"
       option :jobs, type: :integer, default: ENV.fetch("SPECWRK_SEED_JOBS", "1"), aliases: ["-j"], desc: "Number of forked processes used to enumerate examples. Set SPECWRK_PRELOAD too so the application boots once before the fork. Overrides SPECWRK_SEED_JOBS"
+      # Per-run overrides of the server's file-batching knobs. nil defaults on
+      # purpose: 0 is meaningful, so only provided values are sent.
+      option :bucket_run_time, default: ENV["SPECWRK_SRV_BUCKET_RUN_TIME"], desc: "Per-run target run time (seconds) per bucket when the server batches whole files; overrides the server's SPECWRK_SRV_BUCKET_RUN_TIME for this run"
+      option :file_overhead, default: ENV["SPECWRK_SRV_FILE_OVERHEAD"], desc: "Per-run seconds charged per file when packing batched buckets; overrides the server's SPECWRK_SRV_FILE_OVERHEAD for this run"
       argument :dir, type: :array, required: false, desc: "Relative spec directory to run against, default: spec/"
 
-      def call(max_retries:, jobs:, dir:, **args)
+      def call(max_retries:, jobs:, dir:, bucket_run_time: nil, file_overhead: nil, **args)
         dir = ["spec"] if dir.length.zero?
 
         self.class.setup(**args)
@@ -204,8 +208,11 @@ module Specwrk
           exit 1
         end
 
+        bucket_run_time = Float(bucket_run_time) unless bucket_run_time.nil?
+        file_overhead = Float(file_overhead) unless file_overhead.nil?
+
         Client.wait_for_server!
-        Client.new.seed(examples, max_retries)
+        Client.new.seed(examples, max_retries, bucket_run_time: bucket_run_time, file_overhead: file_overhead)
         file_count = examples.group_by { |e| e[:file_path] }.keys.size
         puts "🌱 Seeded #{examples.size} examples across #{file_count} files"
       rescue Errno::ECONNREFUSED

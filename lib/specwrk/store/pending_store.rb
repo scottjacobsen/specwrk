@@ -11,6 +11,8 @@ module Specwrk
     RUN_TIME_BUCKET_MAXIMUM_KEY = :____run_time_bucket_maximum
     MAX_RETRIES_KEY = :____max_retries
     BUCKET_IDS_KEY = :____bucket_ids
+    BUCKET_RUN_TIME_TARGET_KEY = :____bucket_run_time_target
+    FILE_OVERHEAD_KEY = :____file_overhead
 
     def run_time_bucket_maximum=(val)
       @run_time_bucket_maximum = self[RUN_TIME_BUCKET_MAXIMUM_KEY] = val
@@ -18,6 +20,29 @@ module Specwrk
 
     def run_time_bucket_maximum
       @run_time_bucket_maximum ||= self[RUN_TIME_BUCKET_MAXIMUM_KEY]
+    end
+
+    # The seed's per-run overrides persist here (not request-local) so the
+    # requeue and retry paths regroup with the same values.
+
+    # Target run time (seconds) per bucket under the :file strategy;
+    # 0 = one file per bucket. A stored 0 beats a non-zero env value.
+    def bucket_run_time_target=(val)
+      @bucket_run_time_target = self[BUCKET_RUN_TIME_TARGET_KEY] = val
+    end
+
+    def bucket_run_time_target
+      @bucket_run_time_target ||= self[BUCKET_RUN_TIME_TARGET_KEY] || ENV.fetch("SPECWRK_SRV_BUCKET_RUN_TIME", "0").to_f
+    end
+
+    # Seconds charged per FILE when packing batched buckets, on top of its
+    # examples' summed run times. 0 disables the charge, stored or env.
+    def file_overhead=(val)
+      @file_overhead = self[FILE_OVERHEAD_KEY] = val
+    end
+
+    def file_overhead
+      @file_overhead ||= self[FILE_OVERHEAD_KEY] || ENV.fetch("SPECWRK_SRV_FILE_OVERHEAD", "0").to_f
     end
 
     def max_retries=(val)
@@ -87,6 +112,8 @@ module Specwrk
     def reload
       @max_retries = nil
       @bucket_ids = nil
+      @bucket_run_time_target = nil
+      @file_overhead = nil
       super
     end
 
@@ -269,18 +296,6 @@ module Specwrk
       return :file unless run_time_bucket_maximum&.positive?
 
       (ENV["SPECWRK_SRV_GROUP_BY"] == "file") ? :file : :timings
-    end
-
-    # Target total run time (seconds) per bucket when batching whole files under
-    # the :file strategy. 0 (default) keeps the legacy one-file-per-bucket behavior.
-    def bucket_run_time_target
-      @bucket_run_time_target ||= ENV.fetch("SPECWRK_SRV_BUCKET_RUN_TIME", "0").to_f
-    end
-
-    # Seconds charged per FILE when packing batched buckets, on top of its
-    # examples' summed run times. Default 0 keeps the historical behavior.
-    def file_overhead
-      @file_overhead ||= ENV.fetch("SPECWRK_SRV_FILE_OVERHEAD", "0").to_f
     end
   end
 end
