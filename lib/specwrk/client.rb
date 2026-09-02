@@ -80,13 +80,6 @@ module Specwrk
       @mutex.synchronize { @http.finish if @http.started? }
     end
 
-    # For long idle gaps the caller knows about (e.g. an app preload): the
-    # server drops the keep-alive socket well before then, and reconnecting
-    # up front beats paying a logged EOFError retry on the next request.
-    def reconnect
-      @mutex.synchronize { reconnect! }
-    end
-
     def heartbeat
       response = get "/heartbeat"
 
@@ -238,8 +231,8 @@ module Specwrk
         # A server-side idle timeout kills a keep-alive socket undetected;
         # Net::HTTP only auto-retries idempotent methods, so a POST surfaces
         # one of these instead of a clean refusal. On TLS the death arrives
-        # as OpenSSL::SSL::SSLError, not an IOError subclass. Reconnect so
-        # the retry isn't doomed to the same dead socket.
+        # as OpenSSL::SSL::SSLError, not an IOError subclass. Drop the dead
+        # socket so the retry reconnects instead of reusing it.
         record_attempt(request.path, attempt_started_at)
         log_attempt(request, e.class, attempt_started_at)
         retry_or_raise!(e)
@@ -276,20 +269,13 @@ module Specwrk
       sleep @retry_count
     end
 
-    # Best-effort: reconnect runs at every bucket boundary and must never
-    # kill the worker. On a transient connect failure leave the client
-    # unstarted; requests reopen lazily under make_request's bounded retries.
+    # Teardown only, so no connect error can escape from here: the retried
+    # `@http.start` at the top of make_request reopens the socket, and a
+    # connect failure on the way back is retried like any other attempt.
     def reconnect!
       @http.finish
     rescue
       nil
-    ensure
-      begin
-        @http.start
-      rescue Errno::ECONNREFUSED, Errno::EHOSTUNREACH, OpenSSL::SSL::SSLError,
-        Net::OpenTimeout, IO::TimeoutError => e
-        warn "#{ENV.fetch("SPECWRK_ID", "specwrk-client")}: reconnect failed (#{e.class}: #{e.message}); will retry on the next request"
-      end
     end
 
     def default_headers

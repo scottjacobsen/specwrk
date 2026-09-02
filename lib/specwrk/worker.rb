@@ -104,6 +104,10 @@ module Specwrk
       # here; exit controlled instead of crashing away the summary.
       warn "\nTLS connection to #{ENV.fetch("SPECWRK_SRV_URI", "http://localhost:5138")} failed (#{e.message}), exiting..."
       1
+    rescue Net::OpenTimeout, Net::ReadTimeout, Errno::EPIPE, Errno::EHOSTUNREACH, Errno::ETIMEDOUT, IOError => e
+      # IOError also covers IO::TimeoutError (a raw TCP connect timeout) and EOFError.
+      warn "\nConnection to #{ENV.fetch("SPECWRK_SRV_URI", "http://localhost:5138")} failed past retries (#{e.class}: #{e.message}), exiting..."
+      1
     end
 
     # Boot the application once in this long-lived parent process so every
@@ -113,17 +117,14 @@ module Specwrk
       return unless preload_app!
 
       # Drop the connections opened while booting so per-bucket children fork
-      # from a clean, lock-free baseline and each reconnects on its own.
+      # from a clean, lock-free baseline and each reconnects on its own. The
+      # data client is left alone: it has not connected yet, and its first
+      # connect must happen inside make_request where it is retried.
       Specwrk.prepare_for_fork!
 
       # Promote and compact the booted heap so bucket children share more
       # CoW pages and their minor GCs unshare less.
       Process.warmup if Process.respond_to?(:warmup)
-
-      # The data client's keep-alive socket, opened at boot, died server-side
-      # during the minutes the preload took (the heartbeat client kept its own
-      # alive). Reconnect now so the first /pop doesn't log an EOFError retry.
-      client.reconnect
     end
 
     # Run one bucket in a forked child, then report its results. Forking per

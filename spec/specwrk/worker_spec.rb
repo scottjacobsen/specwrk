@@ -106,6 +106,24 @@ RSpec.describe Specwrk::Worker do
       end
     end
 
+    # A queue server unreachable past the client's retries used to escape as
+    # an unhandled Net::OpenTimeout: exit 1 from Ruby with a stack trace and
+    # no summary, and the CLI parent failed the node.
+    context "connect timeout persists past the client's retries" do
+      before do
+        allow(Specwrk::Client).to receive(:wait_for_server!)
+        allow(instance).to receive(:execute)
+          .and_raise(Net::OpenTimeout.new("Failed to open TCP connection"))
+      end
+
+      it "warns and exits with status 1" do
+        expect(instance).to receive(:warn)
+          .with(a_string_including("failed past retries"))
+
+        expect(subject).to eq(1)
+      end
+    end
+
     context "no examples processed" do
       before { allow(Specwrk::Client).to receive(:wait_for_server!) }
 
@@ -673,18 +691,6 @@ RSpec.describe Specwrk::Worker do
       ENV["SPECWRK_PRELOAD"] = "tempfile"
 
       expect(instance).to receive(:require).with("tempfile")
-      expect(client).to receive(:reconnect)
-
-      instance.preload!
-    end
-
-    # The socket died server-side while the preload ran; a stale connection
-    # here means the first /pop logs a pointless EOFError retry.
-    it "reconnects the data client after the preload's long idle gap" do
-      ENV["SPECWRK_PRELOAD"] = "tempfile"
-
-      allow(instance).to receive(:require)
-      expect(client).to receive(:reconnect)
 
       instance.preload!
     end
@@ -693,7 +699,6 @@ RSpec.describe Specwrk::Worker do
       ENV["SPECWRK_PRELOAD"] = "tempfile"
 
       allow(instance).to receive(:require)
-      allow(client).to receive(:reconnect)
       expect(Process).to receive(:warmup)
 
       instance.preload!
@@ -703,10 +708,56 @@ RSpec.describe Specwrk::Worker do
       ENV.delete("SPECWRK_PRELOAD")
 
       expect(instance).not_to receive(:require)
-      expect(client).not_to receive(:reconnect)
       expect(Process).not_to receive(:warmup)
 
       instance.preload!
+    end
+
+    # The preload used to end with an eager "reconnect" of the data client.
+    # The client opens lazily, so that was really its FIRST connect, made
+    # outside make_request's retry loop: one connect timeout at that instant
+    # crashed the worker with no summary. The first connect now happens on
+    # the first server call, where a timeout is retried.
+    context "with a real data client" do
+      let(:client) { Specwrk::Client.new }
+
+      around do |ex|
+        original_retries = ENV["SPECWRK_NETWORK_RETRIES"]
+        previous_net_http = Specwrk.net_http
+        ENV["SPECWRK_NETWORK_RETRIES"] = "1"
+        Specwrk.net_http = Net::HTTP # the WebMock-patched class, as in client_spec
+
+        ex.run
+
+        ENV["SPECWRK_NETWORK_RETRIES"] = original_retries
+        Specwrk.net_http = previous_net_http
+      end
+
+      before do
+        ENV["SPECWRK_PRELOAD"] = "tempfile"
+        allow(instance).to receive(:require)
+        allow(client).to receive(:fetch_examples).and_call_original
+        allow(client).to receive(:warn)
+        allow(client).to receive(:sleep)
+
+        stub_request(:post, "http://localhost:5138/pop")
+          .to_return(status: 200, body: "[]")
+      end
+
+      it "leaves the client unconnected, so a connect timeout on the first server call is retried instead of raised" do
+        http = client.send(:instance_variable_get, :@http)
+        allow(http).to receive(:start).and_invoke(
+          proc { raise IO::TimeoutError, "connect timed out" },
+          proc { true }
+        )
+
+        instance.preload!
+        expect(http).not_to have_received(:start)
+
+        expect(instance.next_examples).to eq([])
+        expect(http).to have_received(:start).twice
+        expect(client).to have_received(:warn).once
+      end
     end
   end
 
