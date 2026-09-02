@@ -286,6 +286,44 @@ RSpec.describe Specwrk::Client do
 
       expect(client.fetch_examples).to eq([])
     end
+
+    # A transient connect failure at a bucket boundary must not crash the
+    # worker — reconnect is an optimization.
+    [Net::OpenTimeout, IO::TimeoutError, Errno::ECONNREFUSED, Errno::EHOSTUNREACH, OpenSSL::SSL::SSLError].each do |error_class|
+      context "when re-opening the connection raises #{error_class}" do
+        before do
+          http = client.instance_variable_get(:@http)
+          allow(http).to receive(:start).and_raise(error_class)
+          allow(client).to receive(:warn)
+        end
+
+        it "swallows the error and warns, leaving the retry to the next request" do
+          expect { client.reconnect }.not_to raise_error
+
+          expect(client).to have_received(:warn).with(/reconnect.*failed.*#{error_class}/)
+        end
+      end
+    end
+
+    it "recovers on the next request after a failed re-open, via the lazy start" do
+      http = client.instance_variable_get(:@http)
+      raised = false
+      allow(http).to receive(:start).and_wrap_original do |original, *args|
+        next original.call(*args) if raised
+
+        raised = true
+        raise Net::OpenTimeout
+      end
+      allow(client).to receive(:warn)
+
+      stub_request(:post, "#{base_uri}/pop")
+        .with(headers: headers)
+        .to_return(status: 200, body: "[]")
+
+      client.reconnect
+
+      expect(client.fetch_examples).to eq([])
+    end
   end
 
   # The connection used to open eagerly in #initialize, which meant a TCP

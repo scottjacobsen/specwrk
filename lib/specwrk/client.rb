@@ -147,10 +147,8 @@ module Specwrk
       end
     end
 
-    # The bucketing overrides go in the payload only when provided: 0 is a
-    # meaningful value for both (disables the per-file charge / forces
-    # one-file-per-bucket), so absent must stay distinguishable from 0 — an
-    # absent key leaves the server's env-configured behavior untouched.
+    # Overrides go in the payload only when provided — 0 is meaningful,
+    # absent means the server env decides.
     def seed(examples, max_retries, bucket_run_time: nil, file_overhead: nil)
       body = {max_retries: max_retries, examples: examples}
       body[:bucket_run_time] = bucket_run_time unless bucket_run_time.nil?
@@ -278,12 +276,20 @@ module Specwrk
       sleep @retry_count
     end
 
+    # Best-effort: reconnect runs at every bucket boundary and must never
+    # kill the worker. On a transient connect failure leave the client
+    # unstarted; requests reopen lazily under make_request's bounded retries.
     def reconnect!
       @http.finish
     rescue
       nil
     ensure
-      @http.start
+      begin
+        @http.start
+      rescue Errno::ECONNREFUSED, Errno::EHOSTUNREACH, OpenSSL::SSL::SSLError,
+        Net::OpenTimeout, IO::TimeoutError => e
+        warn "#{ENV.fetch("SPECWRK_ID", "specwrk-client")}: reconnect failed (#{e.class}: #{e.message}); will retry on the next request"
+      end
     end
 
     def default_headers
