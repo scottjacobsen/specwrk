@@ -274,38 +274,48 @@ RSpec.describe Specwrk::Client do
     end
   end
 
-  describe "#reconnect" do
+  # Teardown only: reopening inside reconnect! put a connect on a path that
+  # is not retried, so a connect timeout there escaped make_request. The
+  # next request's lazy start reopens the socket inside the retried region.
+  describe "#reconnect!" do
     let(:client) { described_class.new }
 
-    it "cycles the connection and requests still work afterwards" do
+    it "drops the connection without reopening it, and the next request reconnects lazily" do
       stub_request(:post, "#{base_uri}/pop")
         .with(headers: headers)
         .to_return(status: 200, body: "[]")
 
-      client.reconnect
+      http = client.send(:instance_variable_get, :@http)
+      expect(client.fetch_examples).to eq([])
+
+      expect(http).to receive(:finish).ordered.and_call_original
+      expect(http).to receive(:start).ordered.and_call_original
+
+      client.send(:reconnect!)
+      expect(http).not_to be_started
 
       expect(client.fetch_examples).to eq([])
     end
 
-    # A transient connect failure at a bucket boundary must not crash the
-    # worker — reconnect is an optimization.
+    # A transient connect failure must never crash the worker. reconnect! no
+    # longer connects at all, so there is no path for one to escape from it.
     [Net::OpenTimeout, IO::TimeoutError, Errno::ECONNREFUSED, Errno::EHOSTUNREACH, OpenSSL::SSL::SSLError].each do |error_class|
-      context "when re-opening the connection raises #{error_class}" do
+      context "when opening a connection would raise #{error_class}" do
         before do
           http = client.instance_variable_get(:@http)
           allow(http).to receive(:start).and_raise(error_class)
-          allow(client).to receive(:warn)
         end
 
-        it "swallows the error and warns, leaving the retry to the next request" do
-          expect { client.reconnect }.not_to raise_error
+        it "does not attempt to connect, so nothing can raise" do
+          http = client.instance_variable_get(:@http)
 
-          expect(client).to have_received(:warn).with(/reconnect.*failed.*#{error_class}/)
+          expect { client.send(:reconnect!) }.not_to raise_error
+          expect(http).not_to have_received(:start)
         end
       end
     end
 
-    it "recovers on the next request after a failed re-open, via the lazy start" do
+    it "recovers on the next request via the retried lazy start when the first re-open fails" do
       http = client.instance_variable_get(:@http)
       raised = false
       allow(http).to receive(:start).and_wrap_original do |original, *args|
@@ -315,14 +325,16 @@ RSpec.describe Specwrk::Client do
         raise Net::OpenTimeout
       end
       allow(client).to receive(:warn)
+      allow(client).to receive(:sleep)
 
       stub_request(:post, "#{base_uri}/pop")
         .with(headers: headers)
         .to_return(status: 200, body: "[]")
 
-      client.reconnect
+      client.send(:reconnect!)
 
       expect(client.fetch_examples).to eq([])
+      expect(client).to have_received(:warn).once
     end
   end
 
