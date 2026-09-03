@@ -116,6 +116,10 @@ module Specwrk
       # from a clean, lock-free baseline and each reconnects on its own.
       Specwrk.prepare_for_fork!
 
+      # Promote and compact the booted heap so bucket children share more
+      # CoW pages and their minor GCs unshare less.
+      Process.warmup if Process.respond_to?(:warmup)
+
       # The data client's keep-alive socket, opened at boot, died server-side
       # during the minutes the preload took (the heartbeat client kept its own
       # alive). Reconnect now so the first /pop doesn't log an EOFError retry.

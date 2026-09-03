@@ -689,11 +689,22 @@ RSpec.describe Specwrk::Worker do
       instance.preload!
     end
 
+    it "warms the process so bucket children share more CoW pages" do
+      ENV["SPECWRK_PRELOAD"] = "tempfile"
+
+      allow(instance).to receive(:require)
+      allow(client).to receive(:reconnect)
+      expect(Process).to receive(:warmup)
+
+      instance.preload!
+    end
+
     it "does nothing when SPECWRK_PRELOAD is unset" do
       ENV.delete("SPECWRK_PRELOAD")
 
       expect(instance).not_to receive(:require)
       expect(client).not_to receive(:reconnect)
+      expect(Process).not_to receive(:warmup)
 
       instance.preload!
     end
