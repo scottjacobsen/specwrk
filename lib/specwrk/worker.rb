@@ -183,10 +183,11 @@ module Specwrk
         Specwrk.after_fork!
         executor.run(examples)
         executor.flush_log
-        flush_final_output
         File.write(results_file.path, JSON.generate(executor.examples + executor.unexecuted_examples))
-        # Results are safely written; give exit-flush hooks (e.g. coverage)
-        # their chance before the hard exit skips every at_exit handler.
+        # Results are safely written first: a hang in the summary flush or an
+        # exit-flush hook (e.g. coverage) is then salvageable, and the hooks
+        # get their chance before the hard exit skips every at_exit handler.
+        flush_final_output
         Specwrk.before_fork_exit!
         Process.exit!(0)
       end
@@ -300,15 +301,15 @@ module Specwrk
 
     attr_reader :running, :client, :heartbeat_client, :executor
 
-    # Flush the child's accumulated failure/pending summary back to the worker's
-    # output stream. Children run sequentially (the parent waits on each), so
-    # writes to the shared $final_output pipe don't interleave.
+    # Append the bucket's failure/pending summary to this worker's final log (the
+    # CLI prints it after every worker exits; stdout without the CLI). Buckets run
+    # one at a time so appends never interleave; open per bucket so no fd spans a fork.
     def flush_final_output
-      executor.final_output.tap(&:rewind).each_line { |line| final_output.write line }
-    end
+      summary = executor.final_output.tap(&:rewind)
+      return IO.copy_stream(summary, $stdout) unless ENV["SPECWRK_FINAL_DIR"]
 
-    def final_output
-      $final_output || $stdout # standard:disable Style/GlobalVars
+      path = File.join(ENV["SPECWRK_FINAL_DIR"], "final-#{ENV.fetch("SPECWRK_FORKED")}.log")
+      File.open(path, "a") { |log| IO.copy_stream(summary, log) }
     end
 
     # The child may die between the timeout decision and the signal; that's a

@@ -3,6 +3,8 @@
 require "pathname"
 require "securerandom"
 require "json"
+require "fileutils"
+require "tmpdir"
 
 require "dry/cli"
 
@@ -16,14 +18,6 @@ module Specwrk
 
     module WorkerProcesses
       WORKER_INIT_SCRIPT = <<~RUBY
-        writer = IO.for_fd(Integer(ENV.fetch("SPECWRK_FINAL_FD")))
-        $final_output = writer # standard:disable Style/GlobalVars
-        $final_output.sync = true # standard:disable Style/GlobalVars
-        # Don't leak this pipe into processes the per-bucket child execs (e.g. the
-        # browser a system spec launches). If an orphaned browser keeps the write
-        # end open, the parent's drain_outputs blocks on EOF forever and the node
-        # is killed on CI's no-output timeout long after the tests finished.
-        $final_output.close_on_exec = true # standard:disable Style/GlobalVars
         $stdout.sync = true
         $stderr.sync = true
 
@@ -37,7 +31,6 @@ module Specwrk
 
         status = Specwrk::Worker.run!
         $stdout.flush
-        $final_output.close # standard:disable Style/GlobalVars
         # Hard-exit (skip at_exit) once the run is reported. A booted app can
         # register at_exit hooks that block on shutdown (e.g. Datadog flushing
         # traces to an absent agent); with output already flushed those hooks add
@@ -47,30 +40,25 @@ module Specwrk
         exit!(status)
       RUBY
 
+      # Workers append their failure/pending summaries to final-<idx>.log in a
+      # shared directory that drain_outputs prints once every worker has exited.
+      # A pipe here wedged a child as soon as its summaries outgrew the 64KB buffer.
       def start_workers
-        @final_outputs = []
+        @final_dir = Dir.mktmpdir("specwrk-final")
         @worker_pids = worker_count.times.map do |i|
-          reader, writer = IO.pipe
-          @final_outputs << reader
+          env = worker_env_for(i + 1).merge("SPECWRK_FINAL_DIR" => @final_dir)
 
-          env = worker_env_for(i + 1).merge(
-            "SPECWRK_FINAL_FD" => writer.fileno.to_s
-          )
-
-          Process.spawn(
-            env, RbConfig.ruby, "-e", WORKER_INIT_SCRIPT,
-            writer.fileno => writer,
-            :in => :close,
-            :close_others => false
-          ).tap { writer.close }
+          Process.spawn(env, RbConfig.ruby, "-e", WORKER_INIT_SCRIPT, in: :close)
         end
       end
 
       def drain_outputs
-        @final_outputs.each do |reader|
-          reader.each_line { |line| $stdout.print line }
-          reader.close
+        1.upto(worker_count) do |idx|
+          path = File.join(@final_dir, "final-#{idx}.log")
+          File.foreach(path) { |line| $stdout.print line } if File.exist?(path)
         end
+      ensure
+        FileUtils.rm_rf(@final_dir)
       end
 
       def worker_count

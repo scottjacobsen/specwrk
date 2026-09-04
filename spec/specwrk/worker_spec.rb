@@ -1,12 +1,23 @@
 # frozen_string_literal: true
 
+require "fileutils"
+require "tmpdir"
+
 require "specwrk/worker"
 
 RSpec.describe Specwrk::Worker do
   let(:client) { instance_double(Specwrk::Client, close: true, stats: {}) }
   let(:heartbeat_client) { instance_double(Specwrk::Client, close: true, stats: {}) }
-  let(:tempfile) { instance_double(Tempfile, rewind: true) }
   let(:thread) { instance_double(Thread, kill: true) }
+  let(:final_dir) { Dir.mktmpdir("specwrk-final-spec") }
+
+  # The bucket summary a child copies into the worker's final log
+  let(:tempfile) do
+    Tempfile.new.tap do |file|
+      file.write("foo\nbar\n")
+      file.flush
+    end
+  end
 
   let(:instance) { described_class.new }
 
@@ -31,24 +42,19 @@ RSpec.describe Specwrk::Worker do
     allow(Thread).to receive(:new)
       .and_return(thread)
 
-    allow(tempfile).to receive(:each_line)
-      .and_yield("foo")
-      .and_yield("bar")
-
     allow($stdout).to receive(:write) # default for e.g. the blank line before a bucket footer
-    allow($stdout).to receive(:write)
-      .with("foo")
-    allow($stdout).to receive(:write)
-      .with("bar")
 
     allow_any_instance_of(described_class).to receive(:log_ts)
   end
 
+  # What the CLI sets for worker 1; children append their summaries under it.
   around do |ex|
-    final_output_reference = $final_output # standard:disable Style/GlobalVars
-    $final_output = nil # standard:disable Style/GlobalVars
+    saved = %w[SPECWRK_FINAL_DIR SPECWRK_FORKED].to_h { |k| [k, ENV[k]] }
+    ENV["SPECWRK_FINAL_DIR"] = final_dir
+    ENV["SPECWRK_FORKED"] = "1"
     ex.run
-    $final_output = final_output_reference # standard:disable Style/GlobalVars
+    saved.each { |k, v| v.nil? ? ENV.delete(k) : ENV[k] = v }
+    FileUtils.rm_rf(final_dir)
   end
 
   describe ".run!" do
@@ -604,6 +610,58 @@ RSpec.describe Specwrk::Worker do
       expect(Process).to have_received(:kill).with("QUIT", kind_of(Integer))
       expect(Process).to have_received(:kill).with("KILL", kind_of(Integer))
       expect(results).to eq([{id: "a.rb:1", status: "failed"}])
+    end
+
+    # Summaries used to cross a pipe the CLI drained only after every worker exited;
+    # past the 64KB buffer the child wedged in the flush until the bucket timeout.
+    it "delivers a summary larger than a pipe buffer without stalling the bucket" do
+      summary = Array.new(4000) { |i| format("line %05d %s\n", i, "x" * 44) }.join # ~220KB
+      summary_file = Tempfile.new.tap do |f|
+        f.write(summary)
+        f.flush
+      end
+      allow(executor).to receive(:final_output).and_return(summary_file)
+      allow(executor).to receive(:run)
+      allow(executor).to receive(:unexecuted_failure) { |example| {id: example[:id], status: "failed"} }
+      allow(instance).to receive(:bucket_timeout).and_return(3)
+
+      results = instance.run_in_fork([{id: "a.rb:1", file_path: "a.rb"}])
+
+      expect(results).to eq(%w[a.rb:1 b.rb:2])
+      expect(File.read(File.join(final_dir, "final-1.log"))).to eq(summary)
+    end
+
+    it "appends each bucket's summary to final-<worker index>.log under SPECWRK_FINAL_DIR" do
+      ENV["SPECWRK_FORKED"] = "3"
+      allow(executor).to receive(:run)
+
+      2.times { instance.run_in_fork([{id: "a.rb:1", file_path: "a.rb"}]) }
+
+      expect(File.read(File.join(final_dir, "final-3.log"))).to eq("foo\nbar\nfoo\nbar\n")
+    end
+
+    it "writes the summary to stdout when SPECWRK_FINAL_DIR is absent (worker run without the CLI)" do
+      ENV.delete("SPECWRK_FINAL_DIR")
+      allow(executor).to receive(:run)
+
+      expect { instance.run_in_fork([{id: "a.rb:1", file_path: "a.rb"}]) }
+        .to output("foo\nbar\n").to_stdout_from_any_process
+    end
+
+    # The results must be on disk before the summary flush, so a child killed
+    # mid-flush (the pipe hang's shape) still has real results to salvage.
+    it "salvages the results when the killed child hung in the summary flush" do
+      allow(instance).to receive(:bucket_timeout).and_return(1)
+      allow(executor).to receive(:run)
+      allow(executor).to receive(:examples)
+        .and_return([{id: "a.rb:1", status: "passed", run_time: 0.1}])
+      allow(instance).to receive(:flush_final_output) { sleep 60 }
+
+      allow(instance).to receive(:log_ts) # the SIGQUIT dump line also logs
+      expect(instance).to receive(:log_ts).with(a_string_including("salvaged"))
+
+      results = instance.run_in_fork([{id: "a.rb:1", file_path: "a.rb"}])
+      expect(results).to eq([{id: "a.rb:1", status: "passed", run_time: 0.1}])
     end
   end
 
