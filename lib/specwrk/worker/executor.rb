@@ -14,10 +14,11 @@ module Specwrk
     class Executor
       # Resolve (and warn on a missing gem) exactly once, here in the
       # long-lived parent before any per-bucket fork — children inherit the
-      # already-loaded gem and the memoized result instead of each repeating
+      # already-loaded gems and the memoized results instead of each repeating
       # the require/rescue/warn dance.
       def initialize
         junit_formatter_class
+        runtime_logger_class
       end
 
       def examples
@@ -108,6 +109,7 @@ module Specwrk
         RSpec.configuration.add_formatter NullFormatter
 
         add_junit_formatter!
+        add_runtime_logger!
 
         true
       end
@@ -172,6 +174,44 @@ module Specwrk
             RSpecJUnitFormatter
           rescue LoadError
             warn "SPECWRK_JUNIT_DIR is set but the rspec_junit_formatter gem is not available (add it to your Gemfile); skipping JUnit output"
+            nil
+          end
+        end
+      end
+
+      # Appends this bucket's per-file runtimes ("path:seconds", one line per
+      # spec file) to the parallel_tests runtime log at SPECWRK_RUNTIME_LOG.
+      # The logger is handed a File opened for append: it reopens a File's
+      # path in "a" mode itself, whereas a path String is truncated ("w") —
+      # by every bucket, here. Per bucket, since RSpec's end-of-run close
+      # notification closes the logger's IO.
+      def add_runtime_logger!
+        return unless runtime_logger_class
+
+        path = ENV.fetch("SPECWRK_RUNTIME_LOG")
+        FileUtils.mkdir_p(File.dirname(path))
+        logger = File.open(path, "a") { |log| runtime_logger_class.new(log) }
+        # The logger flocks around its puts but flushes only after unlocking;
+        # unbuffered output keeps every write inside the lock so concurrent
+        # workers' lines can't tear or interleave.
+        logger.output.sync = true
+
+        RSpec.configuration.add_formatter logger
+      end
+
+      # Optional like JUnit: a missing gem warns once and skips. The logger
+      # records only when TEST_ENV_NUMBER is set, which `specwrk work` does
+      # for every worker.
+      def runtime_logger_class
+        return @runtime_logger_class if defined?(@runtime_logger_class)
+
+        @runtime_logger_class = if ENV["SPECWRK_RUNTIME_LOG"]
+          begin
+            require "parallel_tests/rspec/runtime_logger"
+            warn "SPECWRK_RUNTIME_LOG is set but TEST_ENV_NUMBER is not; parallel_tests' RuntimeLogger records nothing without it" unless ENV["TEST_ENV_NUMBER"]
+            ParallelTests::RSpec::RuntimeLogger
+          rescue LoadError
+            warn "SPECWRK_RUNTIME_LOG is set but the parallel_tests gem is not available (add it to your Gemfile); skipping the runtime log"
             nil
           end
         end

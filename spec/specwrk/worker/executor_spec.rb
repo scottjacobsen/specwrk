@@ -1,6 +1,7 @@
 require "fileutils"
 require "tmpdir"
 require "rspec_junit_formatter"
+require "parallel_tests/rspec/runtime_logger"
 
 require "specwrk/worker/executor"
 
@@ -90,6 +91,83 @@ RSpec.describe Specwrk::Worker::Executor do
 
       expect(instance.run(examples)).to eq("🇺🇸!Big Success!🇺🇸")
     end
+
+    # The real RSpec runner in a forked child, as Worker#run_in_fork does: the
+    # child runs its bucket and hard-exits, so whatever the log holds once the
+    # parent reaps it is what CI gets. The child chdirs into a tmpdir of
+    # generated spec files, keeping this suite's .rspec and .rspec_status out
+    # of its run.
+    context "when SPECWRK_RUNTIME_LOG is set" do
+      let(:dir) { Dir.mktmpdir }
+      let(:log_path) { File.join(dir, "runtime.log") }
+      let(:line_pattern) { /\A\S+_spec\.rb:\d+(\.\d+)?(e-\d+)?\z/ }
+
+      before { stub_const("ENV", ENV.to_h.except("SPECWRK_JUNIT_DIR").merge("SPECWRK_RUNTIME_LOG" => log_path, "TEST_ENV_NUMBER" => "")) }
+      after { FileUtils.rm_rf(dir) }
+
+      # One-example spec files named <prefix>_<i>_spec.rb; returns their bucket.
+      def write_spec_files(prefix, count, body: "expect(1).to eq(1)")
+        Array.new(count) do |i|
+          name = format("%s_%03d_spec.rb", prefix, i)
+          File.write(File.join(dir, name), "RSpec.describe(#{name.inspect}) { it { #{body} } }\n")
+          {id: "./#{name}[1:1]"}
+        end
+      end
+
+      def run_bucket_in_fork(executor, bucket)
+        fork do
+          Dir.chdir(dir)
+          $stdout.reopen(File::NULL)
+          RSpec.configuration.order = :defined # run the bucket's files in order
+          executor.run(bucket)
+          Process.exit!(0)
+        rescue Exception => e # standard:disable Lint/RescueException -- report the child's failure, then hard-exit like the worker
+          warn e.full_message
+          Process.exit!(1)
+        end
+      end
+
+      def wait_all(pids)
+        pids.each do |pid|
+          _, status = Process.wait2(pid)
+          expect(status).to be_success
+        end
+      end
+
+      def logged_files
+        File.readlines(log_path, chomp: true)
+          .each { |line| expect(line).to match(line_pattern) }
+          .map { |line| line.split(":").first }
+      end
+
+      it "appends each sequential bucket's per-file runtimes, keeping every earlier line" do
+        File.write(log_path, "earlier_spec.rb:1.5\n")
+        first = write_spec_files("first", 2)
+        second = write_spec_files("second", 1)
+
+        wait_all([run_bucket_in_fork(instance, first)])
+        wait_all([run_bucket_in_fork(instance, second)])
+
+        expect(File.readlines(log_path, chomp: true).first).to eq("earlier_spec.rb:1.5")
+        expect(logged_files).to contain_exactly("earlier_spec.rb", "first_000_spec.rb", "first_001_spec.rb", "second_000_spec.rb")
+      end
+
+      # Every bucket ends with an example that sleeps until a shared deadline, so
+      # all children reach the logger's end-of-run dump together, each with more
+      # than an IO buffer (8KB) of lines — the shape that tears a line when a
+      # buffered flush straddles the flock.
+      it "keeps every line whole when concurrent children dump at the same moment" do
+        buckets = Array.new(4) { |c| write_spec_files("child#{c}_#{"x" * 60}", 150) }
+        deadline = Process.clock_gettime(Process::CLOCK_REALTIME) + 2
+        buckets.each_with_index do |bucket, c|
+          bucket.concat write_spec_files("child#{c}_barrier", 1, body: "sleep([#{deadline} - Process.clock_gettime(Process::CLOCK_REALTIME), 0].max)")
+        end
+
+        wait_all(buckets.map { |bucket| run_bucket_in_fork(instance, bucket) })
+
+        expect(logged_files).to match_array(Dir.children(dir).grep(/_spec\.rb\z/))
+      end
+    end
   end
 
   describe "#unexecuted_examples" do
@@ -147,10 +225,11 @@ RSpec.describe Specwrk::Worker::Executor do
       Specwrk.force_quit = previous_force_quit
     end
 
-    # Determinism: this pins the no-JUnit-knob shape (exactly three
-    # add_formatter calls), regardless of whatever SPECWRK_JUNIT_DIR happens
-    # to be set to in the ambient environment.
-    before { stub_const("ENV", ENV.to_h.except("SPECWRK_JUNIT_DIR")) }
+    # Determinism: this pins the no-knob shape (exactly three add_formatter
+    # calls), regardless of whatever SPECWRK_JUNIT_DIR / SPECWRK_RUNTIME_LOG
+    # happen to be set to in the ambient environment. Nested contexts merge
+    # their knob into this already-stubbed ENV.
+    before { stub_const("ENV", ENV.to_h.except("SPECWRK_JUNIT_DIR", "SPECWRK_RUNTIME_LOG")) }
 
     it "resets everything to a clean slate" do
       expect(instance.completion_formatter.examples).to receive(:clear)
@@ -274,6 +353,76 @@ RSpec.describe Specwrk::Worker::Executor do
 
         expect(instance.reset!).to eq(true)
         expect(Dir.glob(File.join(junit_dir, "*"))).to eq([])
+      end
+    end
+
+    context "when SPECWRK_RUNTIME_LOG is set" do
+      let(:log_dir) { Dir.mktmpdir }
+      let(:log_path) { File.join(log_dir, "runtime_logs", "node-0.log") }
+
+      before { stub_const("ENV", ENV.to_h.merge("SPECWRK_RUNTIME_LOG" => log_path, "TEST_ENV_NUMBER" => "")) }
+      after { FileUtils.rm_rf(log_dir) }
+
+      # sync pins the concurrency guarantee: the logger flocks around its puts
+      # but flushes only after unlocking, so buffered output could tear.
+      it "adds a RuntimeLogger writing unbuffered to a log it creates, directory included" do
+        stub_rspec_globals!
+        added = []
+        allow(RSpec.configuration).to receive(:add_formatter) { |formatter| added << formatter }
+
+        expect(instance.reset!).to eq(true)
+
+        logger = added.find { |formatter| formatter.is_a?(ParallelTests::RSpec::RuntimeLogger) }
+        expect(logger.output.path).to eq(log_path)
+        expect(logger.output.sync).to be(true)
+        expect(File.exist?(log_path)).to be(true)
+      end
+
+      it "leaves an existing log's lines in place (appends, never truncates)" do
+        FileUtils.mkdir_p(File.dirname(log_path))
+        File.write(log_path, "spec/earlier_spec.rb:1.5\n")
+        stub_rspec_globals!
+
+        instance.reset!
+
+        expect(File.read(log_path)).to eq("spec/earlier_spec.rb:1.5\n")
+      end
+    end
+
+    context "when SPECWRK_RUNTIME_LOG is unset" do
+      it "adds no RuntimeLogger" do
+        stub_rspec_globals!
+        expect(RSpec.configuration).not_to receive(:add_formatter).with(an_instance_of(ParallelTests::RSpec::RuntimeLogger))
+
+        expect(instance.reset!).to eq(true)
+      end
+    end
+
+    context "when SPECWRK_RUNTIME_LOG is set but the parallel_tests gem is not available" do
+      let(:log_dir) { Dir.mktmpdir }
+      let(:log_path) { File.join(log_dir, "runtime.log") }
+
+      before do
+        stub_const("ENV", ENV.to_h.merge("SPECWRK_RUNTIME_LOG" => log_path, "TEST_ENV_NUMBER" => ""))
+        allow_any_instance_of(described_class).to receive(:require)
+          .with("parallel_tests/rspec/runtime_logger")
+          .and_raise(LoadError)
+      end
+
+      after { FileUtils.rm_rf(log_dir) }
+
+      # Built after the require stub, for the same reason as the JUnit case above.
+      it "warns once and continues without a runtime log" do
+        expect_any_instance_of(described_class).to receive(:warn)
+          .with(a_string_including("parallel_tests"))
+          .once
+
+        instance = described_class.new
+        stub_rspec_globals!
+        expect(RSpec.configuration).not_to receive(:add_formatter).with(an_instance_of(ParallelTests::RSpec::RuntimeLogger))
+
+        expect(instance.reset!).to eq(true)
+        expect(File.exist?(log_path)).to be(false)
       end
     end
   end
