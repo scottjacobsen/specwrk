@@ -234,7 +234,7 @@ module Specwrk
         log_attempt(request, e.class, attempt_started_at)
         retry_or_raise!(e)
         retry
-      rescue Errno::ECONNRESET, Errno::EPIPE, IOError, OpenSSL::SSL::SSLError => e
+      rescue Errno::ECONNRESET, Errno::ECONNREFUSED, Errno::EHOSTUNREACH, Errno::EPIPE, IOError, OpenSSL::SSL::SSLError => e
         # A server-side idle timeout kills a keep-alive socket undetected;
         # Net::HTTP only auto-retries idempotent methods, so a POST surfaces
         # one of these instead of a clean refusal. On TLS the death arrives

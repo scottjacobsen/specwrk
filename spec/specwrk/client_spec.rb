@@ -670,6 +670,44 @@ RSpec.describe Specwrk::Client do
         expect { subject }.to raise_error(OpenSSL::SSL::SSLError)
       end
     end
+
+    [Errno::ECONNREFUSED, Errno::EHOSTUNREACH].each do |error_class|
+      context "when the connect raises #{error_class} once, then succeeds" do
+        let(:examples) { [{id: 5, name: "reconnected after #{error_class}"}] }
+
+        before do
+          stub_request(:post, "#{base_uri}/complete_and_pop")
+            .with(headers: headers)
+            .to_return(status: 200, body: examples.to_json)
+        end
+
+        it "reconnects before retrying, returns the parsed body, and resets the retry count" do
+          http = client.send(:instance_variable_get, :@http)
+
+          expect(client).to receive(:warn).once
+          expect(client).to receive(:sleep).once
+          expect(http).to receive(:start).ordered.and_raise(error_class)
+          expect(http).to receive(:finish).ordered.and_call_original
+          expect(http).to receive(:start).ordered.and_call_original
+
+          expect(subject).to eq(examples)
+          expect(client.retry_count).to eq(0)
+        end
+      end
+    end
+
+    context "when the connect keeps being refused across every retry" do
+      it "reconnects and warns each time, then re-raises once retries are exhausted" do
+        http = client.send(:instance_variable_get, :@http)
+        allow(http).to receive(:start).and_raise(Errno::ECONNREFUSED)
+
+        expect(client).to receive(:warn).exactly(10).times
+        expect(client).to receive(:sleep).exactly(5).times
+        expect(http).to receive(:finish).exactly(5).times.and_call_original
+
+        expect { subject }.to raise_error(Errno::ECONNREFUSED)
+      end
+    end
   end
 
   describe "#seed" do
